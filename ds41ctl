@@ -1,0 +1,623 @@
+#!/usr/bin/env python3
+"""Control the single-node DeepSeek V4.1 Flash SGLang service on c04."""
+import argparse
+import base64
+import contextlib
+import datetime
+import fcntl
+import json
+import logging
+import os
+from pathlib import Path
+import shlex
+import secrets
+import signal
+import socket
+import subprocess
+import struct
+import sys
+import time
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
+import zlib
+
+ROOT = Path(__file__).resolve().parent
+CONFIG_PATH = ROOT / 'serving.json'
+RUNS = ROOT / '.runs'
+STATE = RUNS / 'service.json'
+LOG = ROOT / 'sglang.log'
+TMUX = '/scratch_local/user_data/yiming/.local/bin/tmux'
+SOCKET = RUNS / 'ds41-tmux'
+SESSION = 'ds41-c04'
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+RUNTIME_FILES = ['ds41ctl', 'sglang_load.py', 'serving.json', 'README.md', 'DEPLOYMENT_STATUS.md', '.gitignore']
+PRIVATE = ROOT / '.secrets'
+AUTH_CONFIG = PRIVATE / 'sglang-auth.yaml'
+API_KEY = PRIVATE / 'api-key'
+FRPC_CONFIG = PRIVATE / 'frpc.toml'
+FRPC_STATE = RUNS / 'frpc.json'
+FRPC_LOG = RUNS / 'frpc.log'
+LOCAL_BIN = Path('/scratch_local/user_data/yiming/.local/bin')
+GOST_URL = 'http://127.0.0.1:18080?resolver=https://1.1.1.1/dns-query'
+
+
+def auth_headers():
+    return {'Authorization': 'Bearer ' + API_KEY.read_text().strip()} if API_KEY.exists() else {}
+
+
+def redact_log_records():
+    # Also runs when multiprocessing imports this entrypoint in child processes.
+    if not API_KEY.exists():
+        return
+    key = API_KEY.read_text().strip()
+    if not key:
+        return
+    class RedactedStream:
+        def __init__(self, stream):
+            self.stream = stream
+        def write(self, value):
+            self.stream.write(value.replace(key, '<redacted>'))
+            return len(value)
+        def flush(self):
+            return self.stream.flush()
+        def __getattr__(self, name):
+            return getattr(self.stream, name)
+    sys.stderr = RedactedStream(sys.stderr)
+    sys.stdout = RedactedStream(sys.stdout)
+    previous = logging.getLogRecordFactory()
+    def factory(*args, **kwargs):
+        record = previous(*args, **kwargs)
+        message = record.getMessage()
+        if key in message:
+            record.msg = message.replace(key, '<redacted>')
+            record.args = ()
+        return record
+    logging.setLogRecordFactory(factory)
+
+
+redact_log_records()
+
+
+def config():
+    cfg = json.loads(CONFIG_PATH.read_text())
+    if cfg['host'] != '10.78.202.32' or cfg['hostname'] != 's04-p1-dgx-02-c04':
+        raise RuntimeError('This controller is scoped to c04 only')
+    if not 0 < cfg['mem_fraction_static'] < 1:
+        raise ValueError('mem_fraction_static must be between zero and one')
+    if cfg['chunked_prefill_size'] <= 0 or cfg['chunked_prefill_size'] % 256:
+        raise ValueError('chunked_prefill_size must be a positive multiple of 256')
+    return cfg
+
+
+def on_server(cfg):
+    return socket.gethostname().split('.')[0] == cfg['hostname']
+
+
+def run(command, **kwargs):
+    return subprocess.run([str(v) for v in command], check=True, text=True, **kwargs)
+
+
+def tmux(*args, check=True, capture=False):
+    return subprocess.run([TMUX, '-S', str(SOCKET), *map(str, args)], check=check,
+                          text=True, stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+                          stderr=subprocess.PIPE if capture else subprocess.DEVNULL)
+
+
+def session_exists():
+    return tmux('has-session', '-t', SESSION, check=False).returncode == 0
+
+
+def proc_info(pid):
+    try:
+        fields = Path(f'/proc/{pid}/stat').read_text().rpartition(')')[2].split()
+        return {'pid': int(pid), 'state': fields[0], 'pgid': int(fields[2]), 'start_ticks': fields[19]}
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return None
+
+
+def group_members(pgid):
+    found = []
+    for path in Path('/proc').iterdir():
+        if path.name.isdigit():
+            item = proc_info(path.name)
+            if item and item['pgid'] == pgid and item['state'] != 'Z':
+                found.append(item)
+    return found
+
+
+def tracked_state():
+    return json.loads(STATE.read_text()) if STATE.exists() else None
+
+
+def state_is_alive(state):
+    if not state:
+        return False
+    info = proc_info(state['pid'])
+    return bool(info and info['state'] != 'Z' and info['start_ticks'] == state['start_ticks'])
+
+
+@contextlib.contextmanager
+def locked():
+    RUNS.mkdir(exist_ok=True)
+    with (RUNS / 'controller.lock').open('a') as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def request(cfg, path, timeout=5):
+    req = urllib.request.Request(f'http://{cfg["host"]}:{cfg["port"]}{path}', headers=auth_headers())
+    with OPENER.open(req, timeout=timeout) as response:
+        return response.read()
+
+
+def healthy(cfg):
+    try:
+        request(cfg, '/health', timeout=3)
+        return True
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+def sync(cfg):
+    if on_server(cfg):
+        print('Already on c04; runtime files are local.')
+        return
+    run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', cfg['host'],
+         shlex.join(['mkdir', '-p', str(ROOT)])], timeout=15)
+    files = [ROOT / name for name in RUNTIME_FILES if (ROOT / name).exists()]
+    run(['scp', '-q', *files, f'{cfg["host"]}:{ROOT}/'], timeout=60)
+    run(['ssh', '-o', 'BatchMode=yes', cfg['host'],
+         shlex.join(['chmod', '+x', str(ROOT / 'ds41ctl'), str(ROOT / 'sglang_load.py')])], timeout=15)
+    print('Runtime files synchronized to c04; model weights and environments are untouched.')
+
+
+def preflight(cfg):
+    python = ROOT / '.venvs/sglang/bin/python'
+    for path in [python, Path(TMUX), AUTH_CONFIG, API_KEY, Path(cfg['model_path']) / '.checkpoint-verified.json']:
+        if not path.exists():
+            raise RuntimeError(f'Required file is missing: {path}')
+    probe = socket.socket()
+    try:
+        probe.settimeout(1)
+        if probe.connect_ex((cfg['host'], cfg['port'])) == 0:
+            raise RuntimeError('The configured port is already occupied by an untracked service')
+    finally:
+        probe.close()
+    diagnostic = run(['nvidia-smi', '-q', '-x'], capture_output=True, timeout=10)
+    gpus = ET.fromstring(diagnostic.stdout).findall('gpu')
+    if len(gpus) != 4:
+        raise RuntimeError(f'Expected four GPUs on c04; found {len(gpus)}')
+    for index, gpu in enumerate(gpus):
+        action = gpu.findtext('gpu_recovery_action', 'Unknown')
+        if action != 'None':
+            raise RuntimeError(f'GPU {index} recovery action is {action}; refusing to launch')
+    busy = run(['nvidia-smi', '--query-compute-apps=pid,process_name', '--format=csv,noheader'],
+               capture_output=True, timeout=10).stdout.strip()
+    if busy:
+        raise RuntimeError('GPUs have existing compute processes; refusing to disturb them: ' + busy)
+
+
+def launch_environment(cfg):
+    venv = ROOT / '.venvs/sglang'
+    site = next((venv / 'lib').glob('python*/site-packages'))
+    cuda = site / 'nvidia/cu13'
+    cache = RUNS / 'kernel-cache/sglang'
+    env = os.environ.copy()
+    env.update(CUDA_HOME=str(cuda), CUDA_PATH=str(cuda),
+               PATH=f'{cuda}/bin:{venv}/bin:/scratch_local/user_data/yiming/.local/bin:' + env.get('PATH', ''),
+               LD_LIBRARY_PATH=f'{cuda}/lib:' + env.get('LD_LIBRARY_PATH', ''),
+               TMPDIR=str(RUNS / 'tmp'), HF_HOME='/scratch_local/user_data/yiming/.cache/huggingface',
+               HF_HUB_OFFLINE='1', HF_HUB_DISABLE_TELEMETRY='1', TOKENIZERS_PARALLELISM='false',
+               OMP_NUM_THREADS='8', CUDA_VISIBLE_DEVICES='0,1,2,3', NCCL_DEBUG='WARN',
+               XDG_CACHE_HOME=str(cache / '.cache'), SGLANG_CACHE_DIR=str(cache / '.cache/sglang'),
+               SGLANG_JIT_CACHE_DIR=str(cache / '.cache/sglang/jit'),
+               SGLANG_DG_CACHE_DIR=str(cache / '.cache/sglang/deep_gemm'),
+               DG_JIT_CACHE_DIR=str(cache / '.cache/sglang/deep_gemm'),
+               FLASHINFER_WORKSPACE_BASE=str(cache), TRITON_CACHE_DIR=str(cache / '.triton/cache'),
+               CUDA_CACHE_PATH=str(cache / '.nv/ComputeCache'),
+               CC='/usr/bin/gcc-12', CXX='/usr/bin/g++-12')
+    for key in ['HF_TOKEN', 'NCCL_DEBUG_SUBSYS', 'http_proxy', 'https_proxy', 'all_proxy',
+                'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'SGLANG_TEXT_ONLY', 'SGLANG_HIDE_THINKING']:
+        env.pop(key, None)
+    for key in ['TMPDIR', 'XDG_CACHE_HOME', 'SGLANG_CACHE_DIR', 'SGLANG_JIT_CACHE_DIR',
+                'SGLANG_DG_CACHE_DIR', 'TRITON_CACHE_DIR', 'CUDA_CACHE_PATH']:
+        Path(env[key]).mkdir(parents=True, exist_ok=True)
+    return env
+
+
+def serve(cfg):
+    if not on_server(cfg):
+        raise RuntimeError('The engine must run on c04')
+    if os.getpgrp() != os.getpid():
+        os.setpgrp()
+    env = launch_environment(cfg)
+    command = [str(ROOT / '.venvs/sglang/bin/python'), str(ROOT / 'ds41ctl'), '_engine',
+               '--config', str(AUTH_CONFIG),
+               '--model-path', cfg['model_path'], '--served-model-name', cfg['served_model_name'],
+               '--host', cfg['host'], '--port', str(cfg['port']), '--tp', '4', '--ep-size', '4',
+               '--enable-multimodal', '--context-length', str(cfg['context_length']),
+               '--mem-fraction-static', str(cfg['mem_fraction_static']),
+               '--max-running-requests', str(cfg['max_running_requests']),
+               '--chunked-prefill-size', str(cfg['chunked_prefill_size']),
+               '--cuda-graph-max-bs-decode', str(cfg['cuda_graph_max_bs_decode']),
+               '--kv-cache-dtype', 'fp8_e4m3', '--reasoning-parser', 'auto', '--tool-call-parser', 'auto',
+               '--enable-metrics', '--enable-cache-report', '--enable-decoder-swa-bounded-replay',
+               '--speculative-algorithm', 'DSPARK',
+               '--speculative-dspark-block-size', str(cfg['speculative_dspark_block_size'])]
+    state = dict(proc_info(os.getpid()), command=command, config=cfg, started_at=time.time(),
+                 log=str(LOG), cache_root=str(RUNS / 'kernel-cache/sglang'))
+    temporary = STATE.with_suffix('.tmp')
+    temporary.write_text(json.dumps(state, indent=2) + chr(10))
+    temporary.replace(STATE)
+    print('LAUNCH ' + json.dumps(command), flush=True)
+    os.execve(command[0], command, env)
+
+
+def engine():
+    # Use the native launcher and native authentication. Keys stay out of argv.
+    from sglang.launch_server import run_server
+    from sglang.srt.plugins import load_plugins
+    from sglang.srt.server_args import prepare_server_args
+    from sglang.srt.utils import kill_process_tree
+    load_plugins()
+    server_args = prepare_server_args(sys.argv[2:])
+    try:
+        run_server(server_args)
+    finally:
+        kill_process_tree(os.getpid(), include_parent=False)
+
+
+def start(cfg, no_wait):
+    os.umask(0o077)
+    with locked():
+        state = tracked_state()
+        if session_exists() or state_is_alive(state):
+            if healthy(cfg):
+                print(f'Already healthy: http://{cfg["host"]}:{cfg["port"]}/v1')
+                return
+            raise RuntimeError('An owned service is starting or unhealthy; inspect status/logs before restarting')
+        if state and group_members(state['pgid']):
+            raise RuntimeError('Owned child processes remain; run stop before starting')
+        preflight(cfg)
+        (ROOT / 'logs').mkdir(exist_ok=True)
+        if LOG.exists():
+            stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+            LOG.rename(ROOT / 'logs' / f'sglang-{stamp}.log')
+        command = 'exec ' + shlex.join([sys.executable, str(ROOT / 'ds41ctl'), '_serve'])
+        command += ' > ' + shlex.quote(str(LOG)) + ' 2>&1'
+        tmux('new-session', '-d', '-s', SESSION, '-c', ROOT, command)
+    print(f'Started c04 TP4 with vision. Log: {LOG}', flush=True)
+    if no_wait:
+        return
+    deadline = time.monotonic() + cfg['startup_timeout_seconds']
+    report_at = 0
+    while time.monotonic() < deadline:
+        if healthy(cfg):
+            print(f'Ready: http://{cfg["host"]}:{cfg["port"]}/v1; model={cfg["served_model_name"]}')
+            return
+        if not session_exists():
+            raise RuntimeError('Engine exited during startup; run ds41ctl logs')
+        if time.monotonic() >= report_at:
+            print('Waiting for model loading, kernel warmup, and vision initialization...', flush=True)
+            report_at = time.monotonic() + 30
+        time.sleep(5)
+    raise RuntimeError('Readiness timed out; service was left running. Inspect status/logs before restarting.')
+
+
+def stop():
+    with locked():
+        state = tracked_state()
+        if state:
+            info = proc_info(state['pid'])
+            if info and info['start_ticks'] != state['start_ticks']:
+                raise RuntimeError('Tracked PID was reused; refusing to signal it')
+            if group_members(state['pgid']):
+                os.killpg(state['pgid'], signal.SIGTERM)
+                deadline = time.monotonic() + 30
+                while group_members(state['pgid']) and time.monotonic() < deadline:
+                    time.sleep(0.5)
+                if group_members(state['pgid']):
+                    os.killpg(state['pgid'], signal.SIGKILL)
+                    deadline = time.monotonic() + 10
+                    while group_members(state['pgid']) and time.monotonic() < deadline:
+                        time.sleep(0.5)
+                if group_members(state['pgid']):
+                    raise RuntimeError('Owned processes remain after termination; inspect driver/process state')
+        if session_exists():
+            tmux('kill-session', '-t', SESSION)
+        print('DeepSeek stopped on c04. Logs and model files are preserved.')
+
+
+def status(cfg):
+    state = tracked_state()
+    is_healthy = healthy(cfg)
+    print(f'API: {"healthy" if is_healthy else "not ready"} (http://{cfg["host"]}:{cfg["port"]}/v1)')
+    print(f'Tmux: {"up" if session_exists() else "down"}; owned engine: {"up" if state_is_alive(state) else "down"}')
+    if state and state_is_alive(state):
+        live = state['config']
+        print(f'Model: {live["served_model_name"]}; TP4 / EP4; vision enabled; context {live["context_length"]:,}')
+        print(f'Max running: {live["max_running_requests"]}; prefill chunk: {live["chunked_prefill_size"]}; '
+              f'static memory: {live["mem_fraction_static"]}; DSpark block: {live["speculative_dspark_block_size"]}')
+        print(f'PID: {state["pid"]}; log: {LOG}')
+    return 0 if is_healthy and state_is_alive(state) else 1
+
+
+def api_json(cfg, path, payload):
+    req = urllib.request.Request(f'http://{cfg["host"]}:{cfg["port"]}{path}',
+        data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json',
+                                                   'anthropic-version': '2023-06-01', **auth_headers()})
+    try:
+        with OPENER.open(req, timeout=300) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f'HTTP {error.code}: {error.read(1500).decode(errors="replace")}') from error
+
+
+def api_stream(cfg, payload):
+    req = urllib.request.Request(f'http://{cfg["host"]}:{cfg["port"]}/v1/messages',
+        data=json.dumps(dict(payload, stream=True)).encode(), headers={
+            'Content-Type': 'application/json', 'anthropic-version': '2023-06-01', **auth_headers()})
+    blocks = {}
+    partial = {}
+    events = []
+    with OPENER.open(req, timeout=300) as response:
+        for line in response:
+            if not line.startswith(b'data:'):
+                continue
+            value = line[5:].strip()
+            if not value or value == b'[DONE]':
+                continue
+            event = json.loads(value)
+            events.append(event)
+            kind = event.get('type')
+            if kind == 'error':
+                raise RuntimeError('Streaming API error: ' + json.dumps(event))
+            index = event.get('index', 0)
+            if kind == 'content_block_start':
+                blocks[index] = dict(event['content_block'])
+            elif kind == 'content_block_delta':
+                delta = event.get('delta', {})
+                if delta.get('type') == 'text_delta':
+                    blocks.setdefault(index, {'type': 'text', 'text': ''})
+                    blocks[index]['text'] = blocks[index].get('text', '') + delta.get('text', '')
+                elif delta.get('type') == 'input_json_delta':
+                    partial[index] = partial.get(index, '') + delta.get('partial_json', '')
+    for index, raw in partial.items():
+        blocks[index]['input'] = json.loads(raw)
+    return {'content': [blocks[index] for index in sorted(blocks)], 'events': events}
+
+
+def tunnel_state():
+    return json.loads(FRPC_STATE.read_text()) if FRPC_STATE.exists() else None
+
+
+def tunnel_status():
+    state = tunnel_state()
+    alive = state_is_alive(state)
+    print('FRPC: ' + ('running' if alive else 'stopped'))
+    print('Forward: server port 8312 -> 10.78.202.32:18000')
+    print('Server-local API: http://127.0.0.1:8312/v1 on ssh.linsyking.com')
+    print('Transport proxy: http://127.0.0.1:18080; log: ' + str(FRPC_LOG))
+    if FRPC_LOG.exists():
+        for line in FRPC_LOG.read_text(errors='replace').splitlines()[-6:]:
+            print(line)
+    return 0 if alive else 1
+
+
+def tunnel_start(cfg):
+    os.umask(0o077)
+    with locked():
+        if state_is_alive(tunnel_state()):
+            return tunnel_status()
+        for path in [FRPC_CONFIG, API_KEY, LOCAL_BIN / 'frpc', LOCAL_BIN / 'gost']:
+            if not path.exists():
+                raise RuntimeError('Required tunnel file is missing: ' + str(path))
+        if not healthy(cfg):
+            raise RuntimeError('Wait for the API to become healthy before exposing it')
+        request(cfg, '/v1/models')
+        try:
+            with OPENER.open(f'http://{cfg["host"]}:{cfg["port"]}/v1/models', timeout=5):
+                raise RuntimeError('Refusing to expose an API that accepts unauthenticated requests')
+        except urllib.error.HTTPError as error:
+            if error.code != 401:
+                raise RuntimeError('Expected an unauthenticated HTTP 401') from error
+        run([LOCAL_BIN / 'frpc', 'verify', '-c', FRPC_CONFIG], capture_output=True, timeout=15)
+        with socket.socket() as probe:
+            probe.settimeout(1)
+            proxy_up = probe.connect_ex(('127.0.0.1', 18080)) == 0
+        if not proxy_up:
+            subprocess.Popen(['nohup', str(LOCAL_BIN / 'gost'), '-L', GOST_URL],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True)
+            time.sleep(1)
+        # Only launch FRPC after a real request through the requested proxy succeeds.
+        proxy = urllib.request.build_opener(urllib.request.ProxyHandler(
+            {'https': 'http://127.0.0.1:18080'}))
+        req = urllib.request.Request('https://1.1.1.1/dns-query?name=ssh.linsyking.com&type=A',
+            headers={'Accept': 'application/dns-json'})
+        with proxy.open(req, timeout=20) as response:
+            dns = json.load(response)
+            if dns.get('Status') != 0 or not dns.get('Answer'):
+                raise RuntimeError('DNS-over-HTTPS resolution failed')
+        with FRPC_LOG.open('ab') as log:
+            child = subprocess.Popen(['nohup', str(LOCAL_BIN / 'frpc'), '-c', str(FRPC_CONFIG)],
+                cwd=ROOT, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                start_new_session=True)
+        time.sleep(1)
+        info = proc_info(child.pid)
+        if not info or info['state'] == 'Z':
+            raise RuntimeError('FRPC exited; inspect ' + str(FRPC_LOG))
+        FRPC_STATE.write_text(json.dumps(dict(info, started_at=time.time()), indent=2) + chr(10))
+    return tunnel_status()
+
+
+def tunnel_stop():
+    with locked():
+        state = tunnel_state()
+        if state_is_alive(state):
+            os.killpg(state['pgid'], signal.SIGTERM)
+            deadline = time.monotonic() + 10
+            while state_is_alive(state) and time.monotonic() < deadline:
+                time.sleep(0.2)
+            if state_is_alive(state):
+                raise RuntimeError('FRPC did not exit after SIGTERM')
+        print('FRPC stopped. The loopback GOST proxy is left available.')
+
+
+def vision_fixture():
+    """Generate a random image-only four-digit code and two colored rectangles."""
+    code = str(1000 + secrets.randbelow(9000))
+    width, height = 560, 320
+    pixels = bytearray([255] * (width * height * 3))
+    def rectangle(x0, y0, x1, y1, color):
+        row = bytes(color) * (x1 - x0)
+        for y in range(y0, y1):
+            offset = (y * width + x0) * 3
+            pixels[offset:offset + len(row)] = row
+    rectangle(35, 25, 255, 165, (225, 25, 25))
+    rectangle(305, 25, 525, 165, (25, 65, 225))
+    font = {
+        '0': ['11111','10001','10011','10101','11001','10001','11111'],
+        '1': ['00100','01100','00100','00100','00100','00100','01110'],
+        '2': ['11111','00001','00001','11111','10000','10000','11111'],
+        '3': ['11111','00001','00001','01111','00001','00001','11111'],
+        '4': ['10001','10001','10001','11111','00001','00001','00001'],
+        '5': ['11111','10000','10000','11111','00001','00001','11111'],
+        '6': ['11111','10000','10000','11111','10001','10001','11111'],
+        '7': ['11111','00001','00010','00100','01000','01000','01000'],
+        '8': ['11111','10001','10001','11111','10001','10001','11111'],
+        '9': ['11111','10001','10001','11111','00001','00001','11111'],
+    }
+    for digit_index, digit in enumerate(code):
+        for y, row in enumerate(font[digit]):
+            for x, bit in enumerate(row):
+                if bit == '1':
+                    x0, y0 = 135 + digit_index * 75 + x * 11, 205 + y * 11
+                    rectangle(x0, y0, x0 + 11, y0 + 11, (0, 0, 0))
+    def chunk(kind, data):
+        return struct.pack('!I', len(data)) + kind + data + struct.pack('!I', zlib.crc32(kind + data))
+    scanlines = b''.join(b'\x00' + pixels[y * width * 3:(y + 1) * width * 3] for y in range(height))
+    png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('!2I5B', width, height, 8, 2, 0, 0, 0))
+    return code, png + chunk(b'IDAT', zlib.compress(scanlines)) + chunk(b'IEND', b'')
+
+
+def check(cfg):
+    if not healthy(cfg):
+        raise RuntimeError('Server is not healthy; start it and wait for readiness first')
+    stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+    destination = ROOT / 'audit' / f'validation-{stamp}'
+    destination.mkdir(parents=True)
+    results = []
+    model = cfg['served_model_name']
+    code, png = vision_fixture()
+    (destination / 'vision-probe.png').write_bytes(png)
+    encoded = base64.b64encode(png).decode()
+    question = 'Read the four-digit code in the image and name the color of the rectangle on the left. Reply with the code and color only.'
+    def record(name, passed, response):
+        results.append({'test': name, 'passed': bool(passed), 'response': response})
+        (destination / 'results.json').write_text(json.dumps({'expected_image_code': code, 'tests': results}, indent=2) + chr(10))
+        print(name + ': ' + ('PASS' if passed else 'FAIL'), flush=True)
+    text = api_json(cfg, '/v1/chat/completions', {'model': model, 'messages': [
+        {'role': 'user', 'content': 'What is 17 multiplied by 19? Reply with only the integer.'}],
+        'max_tokens': 64, 'temperature': 0, 'chat_template_kwargs': {'thinking': False}})
+    record('chat_text', text['choices'][0]['message'].get('content', '').strip() == '323', text)
+    image_result = api_json(cfg, '/v1/chat/completions', {'model': model, 'messages': [
+        {'role': 'user', 'content': [{'type': 'text', 'text': question},
+         {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + encoded}}]}],
+        'max_tokens': 128, 'temperature': 0, 'chat_template_kwargs': {'thinking': False}})
+    content = image_result['choices'][0]['message'].get('content', '')
+    record('chat_vision', code in content and 'red' in content.lower(), image_result)
+    image_result = api_json(cfg, '/v1/messages', {'model': model, 'messages': [
+        {'role': 'user', 'content': [{'type': 'image', 'source': {'type': 'base64',
+         'media_type': 'image/png', 'data': encoded}}, {'type': 'text', 'text': question}]}],
+        'max_tokens': 128, 'temperature': 0, 'thinking': {'type': 'disabled'}})
+    content = ''.join(block.get('text', '') for block in image_result.get('content', []))
+    record('anthropic_vision', code in content and 'red' in content.lower(), image_result)
+    tools = [{'name': 'fixture_lookup', 'description': 'Read the deployment test value for a key.',
+              'input_schema': {'type': 'object', 'properties': {'key': {'type': 'string'}},
+                               'required': ['key'], 'additionalProperties': False}}]
+    messages = [{'role': 'user', 'content': 'Call fixture_lookup with key deployment, then report exactly the value the tool returns.'}]
+    first = api_json(cfg, '/v1/messages', {'model': model, 'messages': messages, 'tools': tools,
+        'tool_choice': {'type': 'tool', 'name': 'fixture_lookup'}, 'max_tokens': 256,
+        'temperature': 0, 'thinking': {'type': 'disabled'}})
+    calls = [block for block in first.get('content', []) if block.get('type') == 'tool_use']
+    valid = len(calls) == 1 and calls[0].get('name') == 'fixture_lookup' and calls[0].get('input', {}).get('key') == 'deployment'
+    record('anthropic_tool_call', valid, first)
+    if valid:
+        value = 'DS41_OK_' + secrets.token_hex(4)
+        messages += [{'role': 'assistant', 'content': first['content']}, {'role': 'user', 'content': [
+            {'type': 'tool_result', 'tool_use_id': calls[0]['id'], 'content': value}]}]
+        second = api_json(cfg, '/v1/messages', {'model': model, 'messages': messages, 'tools': tools,
+            'max_tokens': 128, 'temperature': 0, 'thinking': {'type': 'disabled'}})
+        content = ''.join(block.get('text', '') for block in second.get('content', []))
+        record('anthropic_tool_result', value in content, second)
+    streamed = api_stream(cfg, {'model': model, 'messages': [
+        {'role': 'user', 'content': [{'type': 'image', 'source': {'type': 'base64',
+         'media_type': 'image/png', 'data': encoded}}, {'type': 'text', 'text': question}]}],
+        'max_tokens': 128, 'temperature': 0, 'thinking': {'type': 'disabled'}})
+    content = ''.join(block.get('text', '') for block in streamed['content'])
+    record('anthropic_streaming_vision', code in content and 'red' in content.lower(), streamed)
+    messages = [{'role': 'user', 'content': 'Call fixture_lookup with key deployment, then report exactly the value the tool returns.'}]
+    first = api_stream(cfg, {'model': model, 'messages': messages, 'tools': tools,
+        'tool_choice': {'type': 'tool', 'name': 'fixture_lookup'}, 'max_tokens': 256,
+        'temperature': 0, 'thinking': {'type': 'disabled'}})
+    calls = [block for block in first['content'] if block.get('type') == 'tool_use']
+    valid = len(calls) == 1 and calls[0].get('name') == 'fixture_lookup' and calls[0].get('input', {}).get('key') == 'deployment'
+    record('anthropic_streaming_tool_call', valid, first)
+    if valid:
+        value = 'DS41_STREAM_' + secrets.token_hex(4)
+        messages += [{'role': 'assistant', 'content': first['content']}, {'role': 'user', 'content': [
+            {'type': 'tool_result', 'tool_use_id': calls[0]['id'], 'content': value}]}]
+        second = api_stream(cfg, {'model': model, 'messages': messages, 'tools': tools,
+            'max_tokens': 128, 'temperature': 0, 'thinking': {'type': 'disabled'}})
+        content = ''.join(block.get('text', '') for block in second['content'])
+        record('anthropic_streaming_tool_result', value in content, second)
+    print(f'Validation evidence: {destination}')
+    return 0 if all(row['passed'] for row in results) and len(results) == 8 else 1
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == '_engine':
+        engine(); return 0
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=['start', 'stop', 'restart', 'status', 'logs', 'sync', 'load', 'check',
+                                         'tunnel-start', 'tunnel-stop', 'tunnel-status', '_serve'])
+    parser.add_argument('--no-wait', action='store_true', help='Return after starting; inspect status for readiness')
+    parser.add_argument('--follow', action='store_true', help='Follow logs until interrupted')
+    args = parser.parse_args()
+    cfg = config()
+    if args.action == 'sync':
+        sync(cfg); return 0
+    if args.action == 'load':
+        return subprocess.call([sys.executable, str(ROOT / 'sglang_load.py')])
+    if args.action == 'check':
+        return check(cfg)
+    if not on_server(cfg):
+        if args.action in ['start', 'restart']:
+            sync(cfg)
+        command = [sys.executable, str(ROOT / 'ds41ctl'), args.action]
+        if args.no_wait: command.append('--no-wait')
+        if args.follow: command.append('--follow')
+        return subprocess.call(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', cfg['host'], shlex.join(command)])
+    if args.action == '_serve': serve(cfg)
+    elif args.action == 'start': start(cfg, args.no_wait)
+    elif args.action == 'stop': stop()
+    elif args.action == 'restart': stop(); start(cfg, args.no_wait)
+    elif args.action == 'status': return status(cfg)
+    elif args.action == 'tunnel-start': return tunnel_start(cfg)
+    elif args.action == 'tunnel-stop': tunnel_stop()
+    elif args.action == 'tunnel-status': return tunnel_status()
+    elif args.action == 'logs':
+        print(f'Log: {LOG}', flush=True)
+        return subprocess.call(['tail', '-F' if args.follow else '-n', str(LOG) if args.follow else '60',
+                                *([] if args.follow else [str(LOG)])])
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
+        print(f'ERROR: {error}', file=sys.stderr)
+        sys.exit(1)

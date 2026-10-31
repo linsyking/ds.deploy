@@ -1,0 +1,14 @@
+{
+  "host": "10.78.202.32",
+  "hostname": "s04-p1-dgx-02-c04",
+  "port": 18000,
+  "model_path": "/scratch_local/user_data/yiming/models/DeepSeek-V4.1-Flash-1017",
+  "served_model_name": "deepseek-v4.1-flash-1017",
+  "context_length": 1048576,
+  "max_running_requests": 16,
+  "chunked_prefill_size": 16384,
+  "mem_fraction_static": 0.8,
+  "cuda_graph_max_bs_decode": 32,
+  "speculative_dspark_block_size": 5,
+  "startup_timeout_seconds": 900
+}
