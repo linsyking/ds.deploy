@@ -63,6 +63,9 @@ def render(base):
           '; TP4; context ' + display(cfg.get('context_length')))
     print('Vision configured: ' + str(cfg.get('enable_multimodal', 'n/a')) +
           '; prefill chunk ' + display(cfg.get('chunked_prefill_size')))
+    defaults = cfg.get('default_chat_template_kwargs') or {}
+    print('Thinking default: ' + str(defaults.get('thinking', 'engine default')) +
+          '; effort: ' + str(defaults.get('reasoning_effort', 'engine default')))
     print()
     capacity = memory.get('token_capacity')
     if any(name in values for name in ['kv_used_tokens', 'kv_evictable_tokens', 'kv_available_tokens']):

@@ -9,9 +9,24 @@
 - TP4 / EP4, native dsv4 attention and flashinfer_mxfp4 MoE backend.
 - Vision enabled; native OpenAI and Anthropic APIs; automatic reasoning/tool parsers.
 - DSpark speculative decoding enabled, block size 5.
+- Reasoning defaults updated to thinking ON / max (100); explicit request overrides remain supported. This is separate from speculative decoding.
 - FP8 E4M3 KV cache, 1,048,576-token context, bounded decoder SWA replay.
 - Selected prefill chunk: 16,384. Static memory fraction: 0.80. Max running requests: 16. Decode graph max batch: 32.
 - Scratch-local CUDA/JIT caches; service managed by ds41ctl and tmux.
+
+## Thinking configuration update
+
+The Anthropic endpoint previously treated output_config.effort="max" without an
+explicit thinking toggle as non-thinking. Controlled non-streaming and streaming
+requests reproduced zero reasoning in that case. Explicit thinking.type="adaptive"
+with max produced reasoning blocks. The launcher now supplies native defaults
+{"thinking": true, "reasoning_effort": "max"}; live verification passed nine reasoning checks. Returned prompt IDs decode to
+Reasoning Effort: 100 and an open thinking header; explicit low decodes to 50.
+Explicit off still produces no reasoning. Vision and tool round trips also work
+with the new default, including streamed thinking. See
+audit/reasoning-check-20261031-154801/ for detailed evidence and the noted
+random-image probe limitation.
+Claude Code files and FRPC/GOST configuration are unchanged.
 
 ## Measured selection
 
@@ -34,7 +49,7 @@ output token for a warm repeated 480K prompt with one user. Warm decode results
 are broadly similar across profiles and noisy at this sample size; the clear
 advantage of 16K is long-prompt prefill latency.
 
-Benchmark conditions: pre-tokenized synthetic input IDs through /v1/completions,
+Benchmark conditions: non-thinking pre-tokenized synthetic input IDs through /v1/completions,
 256 output tokens, temperature 0, one synchronized wave per point, cold-prefix
 and repeated-prefix passes. Input IDs exclude text-tokenization time, so real
 chat/coding and vision latency can differ. A warm pass is an attempted prefix

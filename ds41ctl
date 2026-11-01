@@ -87,6 +87,11 @@ def config():
         raise ValueError('mem_fraction_static must be between zero and one')
     if cfg['chunked_prefill_size'] <= 0 or cfg['chunked_prefill_size'] % 256:
         raise ValueError('chunked_prefill_size must be a positive multiple of 256')
+    if not isinstance(cfg.get('default_thinking', False), bool):
+        raise ValueError('default_thinking must be true or false')
+    effort = cfg.get('default_reasoning_effort', 'high')
+    if effort not in ('low', 'high', 'max') and not (type(effort) is int and 1 <= effort <= 100):
+        raise ValueError('default_reasoning_effort must be low/high/max or an integer 1-100')
     return cfg
 
 
@@ -242,6 +247,9 @@ def serve(cfg):
                '--chunked-prefill-size', str(cfg['chunked_prefill_size']),
                '--cuda-graph-max-bs-decode', str(cfg['cuda_graph_max_bs_decode']),
                '--kv-cache-dtype', 'fp8_e4m3', '--reasoning-parser', 'auto', '--tool-call-parser', 'auto',
+               '--default-chat-template-kwargs', json.dumps({
+                   'thinking': cfg.get('default_thinking', False),
+                   'reasoning_effort': cfg.get('default_reasoning_effort', 'high')}),
                '--enable-metrics', '--enable-cache-report', '--enable-decoder-swa-bounded-replay',
                '--speculative-algorithm', 'DSPARK',
                '--speculative-dspark-block-size', str(cfg['speculative_dspark_block_size'])]
@@ -339,6 +347,8 @@ def status(cfg):
         print(f'Model: {live["served_model_name"]}; TP4 / EP4; vision enabled; context {live["context_length"]:,}')
         print(f'Max running: {live["max_running_requests"]}; prefill chunk: {live["chunked_prefill_size"]}; '
               f'static memory: {live["mem_fraction_static"]}; DSpark block: {live["speculative_dspark_block_size"]}')
+        print(f'Thinking default: {live.get("default_thinking", False)}; '
+              f'effort: {live.get("default_reasoning_effort", "high")} (request overrides take precedence)')
         print(f'PID: {state["pid"]}; log: {LOG}')
     return 0 if is_healthy and state_is_alive(state) else 1
 
@@ -383,6 +393,12 @@ def api_stream(cfg, payload):
                     blocks[index]['text'] = blocks[index].get('text', '') + delta.get('text', '')
                 elif delta.get('type') == 'input_json_delta':
                     partial[index] = partial.get(index, '') + delta.get('partial_json', '')
+                elif delta.get('type') == 'thinking_delta':
+                    blocks.setdefault(index, {'type': 'thinking', 'thinking': ''})
+                    blocks[index]['thinking'] = blocks[index].get('thinking', '') + delta.get('thinking', '')
+                elif delta.get('type') == 'signature_delta':
+                    blocks.setdefault(index, {'type': 'thinking', 'thinking': ''})
+                    blocks[index]['signature'] = delta.get('signature', '')
     for index, raw in partial.items():
         blocks[index]['input'] = json.loads(raw)
     return {'content': [blocks[index] for index in sorted(blocks)], 'events': events}
@@ -577,11 +593,71 @@ def check(cfg):
     return 0 if all(row['passed'] for row in results) and len(results) == 8 else 1
 
 
+def check_reasoning(cfg):
+    if not healthy(cfg):
+        raise RuntimeError('Server is not healthy; wait for startup before checking reasoning')
+    info = json.loads(request(cfg, '/server_info', timeout=15))
+    expected = {'thinking': cfg.get('default_thinking', False),
+                'reasoning_effort': cfg.get('default_reasoning_effort', 'high')}
+    if info.get('default_chat_template_kwargs') != expected:
+        raise RuntimeError('Live thinking defaults differ from serving.json; apply the configuration first')
+    destination = ROOT / 'audit' / ('reasoning-check-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S'))
+    destination.mkdir(parents=True)
+    prompt = ('How many 20-character strings over A, B, and C contain exactly six As, '
+              'seven Bs, and seven Cs, with no two As adjacent? Give the exact integer '
+              'and a brief explanation.')
+    base = {'model': cfg['served_model_name'], 'messages': [{'role': 'user', 'content': prompt}],
+            'max_tokens': 4096, 'temperature': 0}
+    results = []
+    def record(name, passed, detail):
+        results.append({'test': name, 'passed': bool(passed), **detail})
+        (destination / 'summary.json').write_text(json.dumps(
+            {'live_defaults': expected, 'synthetic_prompt': prompt, 'tests': results}, indent=2) + chr(10))
+        print(name + ': ' + ('PASS' if passed else 'FAIL'), flush=True)
+    cases = [
+        ('anthropic_default', {}, expected['thinking']),
+        ('anthropic_max_only', {'output_config': {'effort': 'max'}}, expected['thinking']),
+        ('anthropic_explicit_max', {'thinking': {'type': 'adaptive'}, 'output_config': {'effort': 'max'}}, True),
+        ('anthropic_explicit_off', {'thinking': {'type': 'disabled'}, 'output_config': {'effort': 'max'}}, False),
+    ]
+    for name, options, thinking in cases:
+        response = api_json(cfg, '/v1/messages', dict(base, **options))
+        blocks = response.get('content', [])
+        count = sum(len(b.get('thinking', '')) for b in blocks if b.get('type') == 'thinking')
+        record(name, (count > 0) == thinking and response.get('stop_reason') == 'end_turn',
+               {'options': options, 'reasoning_chars': count, 'usage': response.get('usage')})
+    streamed = api_stream(cfg, dict(base, output_config={'effort': 'max'}))
+    count = sum(len(b.get('thinking', '')) for b in streamed['content'] if b.get('type') == 'thinking')
+    record('anthropic_streaming_max', (count > 0) == expected['thinking'] and
+           any(e.get('type') == 'message_stop' for e in streamed['events']), {'reasoning_chars': count})
+    prompts = []
+    for name, options in [
+        ('openai_default', {}),
+        ('openai_explicit_configured', {'reasoning_effort': expected['reasoning_effort'],
+                                       'chat_template_kwargs': {'thinking': expected['thinking']}}),
+    ]:
+        response = api_json(cfg, '/v1/chat/completions', dict(base, return_prompt_token_ids=True, **options))
+        choice = response['choices'][0]
+        count = len(choice['message'].get('reasoning_content') or '')
+        ids = choice.get('prompt_token_ids')
+        prompts.append(ids)
+        record(name, (count > 0) == expected['thinking'] and choice.get('finish_reason') == 'stop',
+               {'reasoning_chars': count, 'usage': response.get('usage'), 'prompt_token_ids': ids})
+    record('default_prompt_matches_explicit', bool(prompts[0]) and prompts[0] == prompts[1],
+           {'prompt_tokens': len(prompts[0] or [])})
+    response = api_json(cfg, '/v1/chat/completions', dict(base, reasoning_effort='none'))
+    count = len(response['choices'][0]['message'].get('reasoning_content') or '')
+    record('openai_explicit_off', count == 0 and response['choices'][0].get('finish_reason') == 'stop',
+           {'reasoning_chars': count, 'usage': response.get('usage')})
+    print('Reasoning verification: ' + str(destination))
+    return 0 if len(results) == 9 and all(r['passed'] for r in results) else 1
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == '_engine':
         engine(); return 0
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['start', 'stop', 'restart', 'status', 'logs', 'sync', 'load', 'check',
+    parser.add_argument('action', choices=['start', 'stop', 'restart', 'status', 'logs', 'sync', 'load', 'check', 'check-reasoning',
                                          'tunnel-start', 'tunnel-stop', 'tunnel-status', '_serve'])
     parser.add_argument('--no-wait', action='store_true', help='Return after starting; inspect status for readiness')
     parser.add_argument('--follow', action='store_true', help='Follow logs until interrupted')
@@ -593,6 +669,8 @@ def main():
         return subprocess.call([sys.executable, str(ROOT / 'sglang_load.py')])
     if args.action == 'check':
         return check(cfg)
+    if args.action == 'check-reasoning':
+        return check_reasoning(cfg)
     if not on_server(cfg):
         if args.action in ['start', 'restart']:
             sync(cfg)

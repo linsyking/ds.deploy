@@ -18,6 +18,7 @@ Run these commands in this repository on the control host or c04:
     ./ds41ctl load
     ./sglang_load.py 2
     ./ds41ctl check
+    ./ds41ctl check-reasoning
 
 Start/restart sync the small runtime files to c04. The engine runs in a named
 tmux session and survives SSH disconnection. These commands only signal this
@@ -44,7 +45,81 @@ and select the model alias above. Use bearer authentication; the installed
 native middleware checks Authorization, not x-api-key. Native vision accepts
 OpenAI image_url content or Anthropic base64 image content. No text-only
 middleware is installed. Reasoning and structured tool calls use the native
-DeepSeek codec and auto parsers. Reasoning remains client-controlled.
+DeepSeek codec and auto parsers. Reasoning defaults to ON with max effort (numeric effort 100). Explicit
+per-request settings still take precedence.
+
+### Reasoning defaults
+
+serving.json contains default_thinking=true and default_reasoning_effort="max".
+The launcher passes these through SGLang's native --default-chat-template-kwargs.
+This is necessary because Anthropic output_config.effort="max" alone previously
+left thinking at the engine's off default. The engine package itself is unmodified.
+
+Requests that omit the thinking toggle now reason at max effort. Anthropic
+thinking.type="disabled" and OpenAI reasoning_effort="none" still turn thinking
+off. Explicit low/high effort remains supported. No Claude Code settings are changed.
+These defaults take effect after a service restart. ./ds41ctl check-reasoning
+checks actual thinking output, streaming, off overrides, and equality between the
+server-default prompt tokens and an explicitly configured prompt.
+
+For Claude Code / Anthropic, off means thinking.type="disabled". Effort levels
+map to low=50, medium=75, high=75, max=100. OpenAI uses reasoning_effort="none"
+for off and the same native values for low/medium/high/max. The extra xhigh alias
+maps to 75 on OpenAI Chat Completions and 100 on Anthropic Messages; use explicit
+low/high/max for consistent behavior across the two protocols.
+
+Both APIs reach the same model. OpenAI Chat Completions returns reasoning_content;
+Anthropic Messages returns thinking content blocks. Anthropic adaptive thinking is
+implemented as enabled thinking, not Claude's adaptive policy. Anthropic
+thinking.budget_tokens is accepted for SDK compatibility but is not an independent
+hard cap; max_tokens limits total generated reasoning plus answer tokens.
+
+Core text, reasoning, tool calls/round trips, images and streaming have been checked.
+This does not certify every OpenAI/Anthropic endpoint or provider-specific feature;
+Responses and cloud-service APIs are outside this compatibility test scope.
+One random streaming-image content assertion failed without a retained response;
+retesting a known fixture through OpenAI streaming/non-streaming and Anthropic
+streaming succeeded. Protocol compatibility does not guarantee recognition accuracy.
+Details are in audit/reasoning-check-20261031-154801/.
+
+DSH with an Anthropic-compatible provider needs an explicit adaptive-thinking
+compatibility setting for effort levels. Without it, the current DSH pi-ai
+transport sends thinking.budget_tokens (medium=8192, max=16384) and omits
+output_config.effort. SGLang does not enforce those budgets, so both use this
+deployment's default max effort. In the existing model entry in the active
+$DSH_HOME/profiles/<profile>/cordis.patch.yml, merge these fields while preserving
+the other model and provider settings:
+
+```yaml
+- id: deepseek-v4.1-flash-1017
+  compat:
+    forceAdaptiveThinking: true
+  reasoningEfforts:
+    off:
+    low: low
+    medium: medium
+    high: high
+    max: max
+```
+
+The current transport then sends thinking.type=adaptive with
+output_config.effort for enabled levels, and thinking.type=disabled for off.
+The native effort mapping remains low=50, medium/high=75, max=100. If an older
+DSH version rejects forceAdaptiveThinking, use a version supporting this setting.
+The configuration takes effect on the next request; no SGLang restart is needed.
+
+A local reproduction using the pi-ai 1.3.0 dependency pinned by current DSH,
+including its upstream DSH patch, verified both request fields and streamed
+output against c04. With adaptive mode, off returned zero reasoning characters,
+medium returned 1050, and max returned 2408 on one synthetic prompt. These are
+diagnostics, not latency or quality guarantees. The user's inaccessible DSH
+installation and its reported identical 39-second times have not been inspected;
+the off failure did not reproduce in the current transport. Evidence is in
+audit/dsh-reasoning-20261031-155906/.
+
+The published latency comparison used non-thinking synthetic token-ID prompts.
+Max thinking can generate additional reasoning tokens and delay the visible final
+answer; the previous benchmark is not a max-thinking latency guarantee.
 
 The context limit is 1,048,576 tokens, including prompt and generated output.
 The intended workload is one or two users below 500K tokens, with 1M tested

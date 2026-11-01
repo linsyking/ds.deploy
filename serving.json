@@ -10,5 +10,7 @@
   "mem_fraction_static": 0.8,
   "cuda_graph_max_bs_decode": 32,
   "speculative_dspark_block_size": 5,
-  "startup_timeout_seconds": 900
+  "startup_timeout_seconds": 900,
+  "default_thinking": true,
+  "default_reasoning_effort": "max"
 }
