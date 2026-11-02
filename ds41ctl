@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Control the single-node DeepSeek V4.1 Flash SGLang service on c04."""
+"""Control the configured single-node DeepSeek V4.1 Flash SGLang service."""
 import argparse
 import base64
 import contextlib
@@ -10,6 +10,7 @@ import logging
 import os
 from pathlib import Path
 import shlex
+import shutil
 import secrets
 import signal
 import socket
@@ -17,6 +18,7 @@ import subprocess
 import struct
 import sys
 import time
+import tomllib
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -29,12 +31,13 @@ STATE = RUNS / 'service.json'
 LOG = ROOT / 'sglang.log'
 TMUX = '/scratch_local/user_data/yiming/.local/bin/tmux'
 SOCKET = RUNS / 'ds41-tmux'
-SESSION = 'ds41-c04'
+SESSION = 'ds41-' + socket.gethostname().split('.')[0].rsplit('-', 1)[-1]
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-RUNTIME_FILES = ['ds41ctl', 'sglang_load.py', 'serving.json', 'README.md', 'DEPLOYMENT_STATUS.md', '.gitignore']
+RUNTIME_FILES = ['ds41ctl', 'sglang_load.py', 'thinking_budget.py', 'web_search.py', 'serving.json', 'README.md', 'DEPLOYMENT_STATUS.md', '.gitignore']
 PRIVATE = ROOT / '.secrets'
 AUTH_CONFIG = PRIVATE / 'sglang-auth.yaml'
 API_KEY = PRIVATE / 'api-key'
+EXA_API_KEY = PRIVATE / 'exa-api-key'
 FRPC_CONFIG = PRIVATE / 'frpc.toml'
 FRPC_STATE = RUNS / 'frpc.json'
 FRPC_LOG = RUNS / 'frpc.log'
@@ -48,16 +51,19 @@ def auth_headers():
 
 def redact_log_records():
     # Also runs when multiprocessing imports this entrypoint in child processes.
-    if not API_KEY.exists():
+    keys = tuple(path.read_text().strip() for path in (API_KEY, EXA_API_KEY)
+                 if path.exists() and path.read_text().strip())
+    if not keys:
         return
-    key = API_KEY.read_text().strip()
-    if not key:
-        return
+    def redact(value):
+        for key in keys:
+            value = value.replace(key, '<redacted>')
+        return value
     class RedactedStream:
         def __init__(self, stream):
             self.stream = stream
         def write(self, value):
-            self.stream.write(value.replace(key, '<redacted>'))
+            self.stream.write(redact(value))
             return len(value)
         def flush(self):
             return self.stream.flush()
@@ -69,8 +75,9 @@ def redact_log_records():
     def factory(*args, **kwargs):
         record = previous(*args, **kwargs)
         message = record.getMessage()
-        if key in message:
-            record.msg = message.replace(key, '<redacted>')
+        cleaned = redact(message)
+        if cleaned != message:
+            record.msg = cleaned
             record.args = ()
         return record
     logging.setLogRecordFactory(factory)
@@ -78,17 +85,27 @@ def redact_log_records():
 
 redact_log_records()
 
+# multiprocessing spawn imports this file in scheduler processes as well.
+if os.environ.get('DS41_THINKING_BUDGET') == '1':
+    from thinking_budget import install
+    install()
+
 
 def config():
     cfg = json.loads(CONFIG_PATH.read_text())
-    if cfg['host'] != '10.78.202.32' or cfg['hostname'] != 's04-p1-dgx-02-c04':
-        raise RuntimeError('This controller is scoped to c04 only')
+    allowed = {'10.78.202.30': 's04-p1-dgx-02-c02', '10.78.202.32': 's04-p1-dgx-02-c04'}
+    if allowed.get(cfg['host']) != cfg['hostname']:
+        raise RuntimeError('The deployment target must be the configured c02 or c04 hostname/IP pair')
     if not 0 < cfg['mem_fraction_static'] < 1:
         raise ValueError('mem_fraction_static must be between zero and one')
     if cfg['chunked_prefill_size'] <= 0 or cfg['chunked_prefill_size'] % 256:
         raise ValueError('chunked_prefill_size must be a positive multiple of 256')
     if not isinstance(cfg.get('default_thinking', False), bool):
         raise ValueError('default_thinking must be true or false')
+    if not isinstance(cfg.get('enforce_thinking_budget', False), bool):
+        raise ValueError('enforce_thinking_budget must be true or false')
+    if not isinstance(cfg.get('enable_web_search', False), bool):
+        raise ValueError('enable_web_search must be true or false')
     effort = cfg.get('default_reasoning_effort', 'high')
     if effort not in ('low', 'high', 'max') and not (type(effort) is int and 1 <= effort <= 100):
         raise ValueError('default_reasoning_effort must be low/high/max or an integer 1-100')
@@ -166,7 +183,7 @@ def healthy(cfg):
 
 def sync(cfg):
     if on_server(cfg):
-        print('Already on c04; runtime files are local.')
+        print(f'Already on {cfg["hostname"]}; runtime files are local.')
         return
     run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', cfg['host'],
          shlex.join(['mkdir', '-p', str(ROOT)])], timeout=15)
@@ -174,7 +191,7 @@ def sync(cfg):
     run(['scp', '-q', *files, f'{cfg["host"]}:{ROOT}/'], timeout=60)
     run(['ssh', '-o', 'BatchMode=yes', cfg['host'],
          shlex.join(['chmod', '+x', str(ROOT / 'ds41ctl'), str(ROOT / 'sglang_load.py')])], timeout=15)
-    print('Runtime files synchronized to c04; model weights and environments are untouched.')
+    print(f'Runtime files synchronized to {cfg["hostname"]}; model weights and environments are untouched.')
 
 
 def preflight(cfg):
@@ -182,6 +199,8 @@ def preflight(cfg):
     for path in [python, Path(TMUX), AUTH_CONFIG, API_KEY, Path(cfg['model_path']) / '.checkpoint-verified.json']:
         if not path.exists():
             raise RuntimeError(f'Required file is missing: {path}')
+    if cfg.get('enable_web_search', False) and (not EXA_API_KEY.exists() or not EXA_API_KEY.read_text().strip()):
+        raise RuntimeError('Web search requires a credential in .secrets/exa-api-key')
     probe = socket.socket()
     try:
         probe.settimeout(1)
@@ -192,7 +211,7 @@ def preflight(cfg):
     diagnostic = run(['nvidia-smi', '-q', '-x'], capture_output=True, timeout=10)
     gpus = ET.fromstring(diagnostic.stdout).findall('gpu')
     if len(gpus) != 4:
-        raise RuntimeError(f'Expected four GPUs on c04; found {len(gpus)}')
+        raise RuntimeError(f'Expected four GPUs on the configured node; found {len(gpus)}')
     for index, gpu in enumerate(gpus):
         action = gpu.findtext('gpu_recovery_action', 'Unknown')
         if action != 'None':
@@ -222,6 +241,23 @@ def launch_environment(cfg):
                FLASHINFER_WORKSPACE_BASE=str(cache), TRITON_CACHE_DIR=str(cache / '.triton/cache'),
                CUDA_CACHE_PATH=str(cache / '.nv/ComputeCache'),
                CC='/usr/bin/gcc-12', CXX='/usr/bin/g++-12')
+    for version in ['12', '13', '11']:
+        cc, cxx = shutil.which('gcc-' + version), shutil.which('g++-' + version)
+        if cc and cxx:
+            env.update(CC=cc, CXX=cxx)
+            break
+    else:
+        raise RuntimeError('A matching GCC/G++ 12, 13, or 11 compiler pair is required')
+    env.pop('DS41_THINKING_BUDGET', None)
+    env.pop('SGLANG_MAX_THINK_TOKENS', None)
+    env.pop('EXA_API_KEY', None)
+    if cfg.get('enable_web_search', False):
+        env['EXA_API_KEY'] = EXA_API_KEY.read_text().strip()
+    if cfg.get('enforce_thinking_budget', False):
+        env['DS41_THINKING_BUDGET'] = '1'
+        # Enables native budget filtering. Explicit budgets override this
+        # unreachable ceiling; ordinary requests skip the strict grammar.
+        env['SGLANG_MAX_THINK_TOKENS'] = str(cfg['context_length'])
     for key in ['HF_TOKEN', 'NCCL_DEBUG_SUBSYS', 'http_proxy', 'https_proxy', 'all_proxy',
                 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'SGLANG_TEXT_ONLY', 'SGLANG_HIDE_THINKING']:
         env.pop(key, None)
@@ -233,7 +269,7 @@ def launch_environment(cfg):
 
 def serve(cfg):
     if not on_server(cfg):
-        raise RuntimeError('The engine must run on c04')
+        raise RuntimeError('The engine must run on the configured server hostname')
     if os.getpgrp() != os.getpid():
         os.setpgrp()
     env = launch_environment(cfg)
@@ -253,6 +289,8 @@ def serve(cfg):
                '--enable-metrics', '--enable-cache-report', '--enable-decoder-swa-bounded-replay',
                '--speculative-algorithm', 'DSPARK',
                '--speculative-dspark-block-size', str(cfg['speculative_dspark_block_size'])]
+    if cfg.get('enforce_thinking_budget', False):
+        command.append('--enable-strict-thinking')
     state = dict(proc_info(os.getpid()), command=command, config=cfg, started_at=time.time(),
                  log=str(LOG), cache_root=str(RUNS / 'kernel-cache/sglang'))
     temporary = STATE.with_suffix('.tmp')
@@ -270,6 +308,9 @@ def engine():
     from sglang.srt.utils import kill_process_tree
     load_plugins()
     server_args = prepare_server_args(sys.argv[2:])
+    if config().get('enable_web_search', False):
+        from web_search import install
+        install(api_key=API_KEY.read_text().strip(), exa_api_key=EXA_API_KEY.read_text().strip())
     try:
         run_server(server_args)
     finally:
@@ -295,7 +336,7 @@ def start(cfg, no_wait):
         command = 'exec ' + shlex.join([sys.executable, str(ROOT / 'ds41ctl'), '_serve'])
         command += ' > ' + shlex.quote(str(LOG)) + ' 2>&1'
         tmux('new-session', '-d', '-s', SESSION, '-c', ROOT, command)
-    print(f'Started c04 TP4 with vision. Log: {LOG}', flush=True)
+    print(f'Started {cfg["hostname"]} TP4 with vision. Log: {LOG}', flush=True)
     if no_wait:
         return
     deadline = time.monotonic() + cfg['startup_timeout_seconds']
@@ -334,7 +375,7 @@ def stop():
                     raise RuntimeError('Owned processes remain after termination; inspect driver/process state')
         if session_exists():
             tmux('kill-session', '-t', SESSION)
-        print('DeepSeek stopped on c04. Logs and model files are preserved.')
+        print('Owned DeepSeek service stopped. Logs and model files are preserved.')
 
 
 def status(cfg):
@@ -349,6 +390,8 @@ def status(cfg):
               f'static memory: {live["mem_fraction_static"]}; DSpark block: {live["speculative_dspark_block_size"]}')
         print(f'Thinking default: {live.get("default_thinking", False)}; '
               f'effort: {live.get("default_reasoning_effort", "high")} (request overrides take precedence)')
+        print(f'Explicit thinking budgets: {live.get("enforce_thinking_budget", False)}')
+        print(f'Anthropic web search: {"Exa" if live.get("enable_web_search", False) else "disabled"}')
         print(f'PID: {state["pid"]}; log: {LOG}')
     return 0 if is_healthy and state_is_alive(state) else 1
 
@@ -408,11 +451,11 @@ def tunnel_state():
     return json.loads(FRPC_STATE.read_text()) if FRPC_STATE.exists() else None
 
 
-def tunnel_status():
+def tunnel_status(cfg):
     state = tunnel_state()
     alive = state_is_alive(state)
     print('FRPC: ' + ('running' if alive else 'stopped'))
-    print('Forward: server port 8312 -> 10.78.202.32:18000')
+    print(f'Forward: server port 8312 -> {cfg["host"]}:{cfg["port"]}')
     print('Server-local API: http://127.0.0.1:8312/v1 on ssh.linsyking.com')
     print('Transport proxy: http://127.0.0.1:18080; log: ' + str(FRPC_LOG))
     if FRPC_LOG.exists():
@@ -425,10 +468,15 @@ def tunnel_start(cfg):
     os.umask(0o077)
     with locked():
         if state_is_alive(tunnel_state()):
-            return tunnel_status()
+            return tunnel_status(cfg)
         for path in [FRPC_CONFIG, API_KEY, LOCAL_BIN / 'frpc', LOCAL_BIN / 'gost']:
             if not path.exists():
                 raise RuntimeError('Required tunnel file is missing: ' + str(path))
+        tunnel_cfg = tomllib.loads(FRPC_CONFIG.read_text())
+        routes = [route for route in tunnel_cfg.get('proxies', []) if route.get('remotePort') == 8312]
+        if len(routes) != 1 or routes[0].get('type') != 'tcp' or routes[0].get('localIP') != cfg['host'] or routes[0].get('localPort') != cfg['port']:
+            raise RuntimeError('FRPC port 8312 must target the configured SGLang API at '
+                               + f'{cfg["host"]}:{cfg["port"]}; update .secrets/frpc.toml')
         if not healthy(cfg):
             raise RuntimeError('Wait for the API to become healthy before exposing it')
         request(cfg, '/v1/models')
@@ -465,7 +513,7 @@ def tunnel_start(cfg):
         if not info or info['state'] == 'Z':
             raise RuntimeError('FRPC exited; inspect ' + str(FRPC_LOG))
         FRPC_STATE.write_text(json.dumps(dict(info, started_at=time.time()), indent=2) + chr(10))
-    return tunnel_status()
+    return tunnel_status(cfg)
 
 
 def tunnel_stop():
@@ -653,12 +701,113 @@ def check_reasoning(cfg):
     return 0 if len(results) == 9 and all(r['passed'] for r in results) else 1
 
 
+def check_budget(cfg):
+    from concurrent.futures import ThreadPoolExecutor
+    from transformers import AutoTokenizer
+    if not cfg.get('enforce_thinking_budget') or not healthy(cfg):
+        raise RuntimeError('Enable thinking budgets and wait for server readiness first')
+    tokenizer = AutoTokenizer.from_pretrained(cfg['model_path'], trust_remote_code=True, local_files_only=True)
+    destination = ROOT / 'audit' / ('thinking-budget-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S'))
+    destination.mkdir(parents=True)
+    results = []
+    prompt = ('Solve this Sudoku without tools. Zero means blank. Check every row, column, and 3x3 box. '
+              'Return the nine completed rows.\n100007090\n030020008\n009600500\n005300900\n'
+              '010080002\n600004000\n300000010\n040000007\n007000300')
+    base = {'model': cfg['served_model_name'], 'messages': [{'role': 'user', 'content': prompt}],
+            'max_tokens': 4096, 'temperature': 0}
+    def record(name, passed, **detail):
+        results.append({'test': name, 'passed': bool(passed), **detail})
+        (destination / 'summary.json').write_text(json.dumps({'prompt': prompt, 'tests': results}, indent=2) + chr(10))
+        print(name + ': ' + ('PASS' if passed else 'FAIL'), flush=True)
+    end_ids = tokenizer.encode('</think>', add_special_tokens=False)
+    # Raw generated IDs prove the boundary without relying on text re-tokenization
+    # or the engine's reasoning-usage estimate, which can include framing tokens.
+    for budget in [16, 128]:
+        response = api_json(cfg, '/v1/chat/completions', dict(base, reasoning_effort='max',
+            custom_params={'thinking_budget': budget}, return_token_ids=True))
+        choice = response['choices'][0]
+        ids = choice.get('response_token_ids') or []
+        boundary = next((i for i in range(len(ids)) if ids[i:i+len(end_ids)] == end_ids), None)
+        record(f'raw_boundary_{budget}', boundary == budget and bool(choice['message'].get('content')),
+               boundary=boundary, budget=budget, response=response)
+    def probe(item):
+        budget, streaming = item
+        payload = dict(base, thinking={'type': 'enabled', 'budget_tokens': budget})
+        start = time.monotonic()
+        response = api_stream(cfg, payload) if streaming else api_json(cfg, '/v1/messages', payload)
+        reasoning = ''.join(b.get('thinking', '') for b in response.get('content', []))
+        answer = ''.join(b.get('text', '') for b in response.get('content', []))
+        count = len(tokenizer.encode(reasoning, add_special_tokens=False))
+        ended = (any(e.get('type') == 'message_stop' for e in response['events']) if streaming
+                 else response.get('stop_reason') == 'end_turn')
+        return budget, streaming, count, bool(answer), ended, time.monotonic()-start, response
+    # Mixed budgets in the same batch check isolation and DSpark mask rollback.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for budget, streaming, count, answer, ended, elapsed, response in pool.map(
+                probe, [(1024, False), (1024, True), (2048, False), (2048, True)]):
+            record(f'anthropic_{budget}_{"stream" if streaming else "json"}',
+                   0 < count <= budget and answer and ended, budget=budget,
+                   retokenized_reasoning_tokens=count, elapsed_seconds=elapsed, response=response)
+    options = {'model': cfg['served_model_name'], 'max_tokens': 4096, 'temperature': 0,
+               'thinking': {'type': 'enabled', 'budget_tokens': 1024}}
+    tools = [{'name': 'fixture_lookup', 'description': 'Return the value for a key.',
+              'input_schema': {'type': 'object', 'properties': {'key': {'type': 'string'}}, 'required': ['key']}}]
+    messages = [{'role': 'user', 'content': 'Call fixture_lookup with key deployment and report its returned value.'}]
+    first = api_stream(cfg, dict(options, messages=messages, tools=tools,
+                                tool_choice={'type': 'tool', 'name': 'fixture_lookup'}))
+    calls = [b for b in first['content'] if b.get('type') == 'tool_use']
+    valid = len(calls) == 1 and calls[0].get('input', {}).get('key') == 'deployment'
+    record('budget_tool_call', valid, response=first)
+    if valid:
+        value = 'BUDGET_OK_' + secrets.token_hex(4)
+        messages += [{'role': 'assistant', 'content': first['content']}, {'role': 'user', 'content': [
+            {'type': 'tool_result', 'tool_use_id': calls[0]['id'], 'content': value}]}]
+        second = api_stream(cfg, dict(options, messages=messages, tools=tools))
+        record('budget_tool_result', value in ''.join(b.get('text', '') for b in second['content']), response=second)
+    code, png = vision_fixture()
+    (destination / 'vision.png').write_bytes(png)
+    image = {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/png', 'data': base64.b64encode(png).decode()}}
+    response = api_stream(cfg, dict(options, messages=[{'role': 'user', 'content': [image,
+        {'type': 'text', 'text': 'Read the four-digit code and the color of the left rectangle. Reply only with code and color.'}]}]))
+    answer = ''.join(b.get('text', '') for b in response['content'])
+    record('budget_vision', code in answer and 'red' in answer.lower(), expected_code=code, response=response)
+    print('Thinking budget verification: ' + str(destination))
+    return 0 if len(results) == 9 and all(r['passed'] for r in results) else 1
+
+
+def check_search(cfg):
+    destination = ROOT / 'audit' / ('search-validation-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S'))
+    destination.mkdir(parents=True, exist_ok=True)
+    results = []
+    for stream, version in [(False, 'web_search_20250305'), (True, 'web_search_20260209')]:
+        payload = {
+            'model': cfg['served_model_name'], 'max_tokens': 512, 'temperature': 0,
+            'thinking': {'type': 'disabled'},
+            'system': 'Answer in one sentence and cite one official source URL from the search evidence.',
+            'messages': [{'role': 'user', 'content':
+                          'Perform a web search for the query: SGLang native Exa web_search support'}],
+            'tools': [{'type': version, 'name': 'web_search',
+                       'allowed_domains': ['github.com', 'docs.sglang.ai']}],
+            'tool_choice': {'type': 'tool', 'name': 'web_search'},
+        }
+        started = time.monotonic()
+        response = api_stream(cfg, payload) if stream else api_json(cfg, '/v1/messages', payload)
+        answer = ''.join(block.get('text', '') for block in response.get('content', []))
+        passed = 'https://' in answer and any(domain in answer for domain in ('github.com', 'docs.sglang.ai'))
+        results.append({'stream': stream, 'tool_type': version, 'passed': passed,
+                        'elapsed_seconds': round(time.monotonic() - started, 3), 'response': response})
+        print(f'Anthropic Exa search {"stream" if stream else "JSON"}: {"PASS" if passed else "FAIL"}')
+    (destination / 'summary.json').write_text(json.dumps(results, indent=2) + chr(10))
+    print('Search verification: ' + str(destination))
+    return 0 if all(result['passed'] for result in results) else 1
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == '_engine':
         engine(); return 0
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['start', 'stop', 'restart', 'status', 'logs', 'sync', 'load', 'check', 'check-reasoning',
-                                         'tunnel-start', 'tunnel-stop', 'tunnel-status', '_serve'])
+    parser.add_argument('action', choices=['start', 'stop', 'restart', 'status', 'logs', 'sync', 'load', 'check',
+                                         'check-reasoning', 'check-budget', 'check-search', 'tunnel-start', 'tunnel-stop', 'tunnel-status', '_serve'])
     parser.add_argument('--no-wait', action='store_true', help='Return after starting; inspect status for readiness')
     parser.add_argument('--follow', action='store_true', help='Follow logs until interrupted')
     args = parser.parse_args()
@@ -671,6 +820,15 @@ def main():
         return check(cfg)
     if args.action == 'check-reasoning':
         return check_reasoning(cfg)
+    if args.action == 'check-search':
+        return check_search(cfg)
+    if args.action == 'check-budget':
+        command = [str(ROOT / '.venvs/sglang/bin/python'), str(ROOT / 'ds41ctl'), 'check-budget']
+        if not on_server(cfg):
+            return subprocess.call(['ssh', '-o', 'BatchMode=yes', cfg['host'], shlex.join(command)])
+        if Path(sys.prefix) != ROOT / '.venvs/sglang':
+            return subprocess.call(command)
+        return check_budget(cfg)
     if not on_server(cfg):
         if args.action in ['start', 'restart']:
             sync(cfg)
@@ -685,7 +843,7 @@ def main():
     elif args.action == 'status': return status(cfg)
     elif args.action == 'tunnel-start': return tunnel_start(cfg)
     elif args.action == 'tunnel-stop': tunnel_stop()
-    elif args.action == 'tunnel-status': return tunnel_status()
+    elif args.action == 'tunnel-status': return tunnel_status(cfg)
     elif args.action == 'logs':
         print(f'Log: {LOG}', flush=True)
         return subprocess.call(['tail', '-F' if args.follow else '-n', str(LOG) if args.follow else '60',

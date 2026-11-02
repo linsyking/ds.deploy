@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Show c04 SGLang requests, cache, throughput, and memory. Optional refresh interval."""
+"""Show the configured SGLang requests, cache, throughput, and memory."""
 import argparse
 import datetime
 import json

@@ -1,14 +1,14 @@
-# DeepSeek V4.1 Flash on c04
+# DeepSeek V4.1 Flash on c02
 
-Single-node deployment of deepseek-ai/DeepSeek-V4.1-Flash-1017 on c04
-(10.78.202.32), using four GB200 GPUs and SGLang 0.5.23.
+Single-node deployment of deepseek-ai/DeepSeek-V4.1-Flash-1017 on c02
+(10.78.202.30), using four GB200 GPUs and SGLang 0.5.23.
 Checkpoint revision: 1bae0e1088993b9b82de08f59de5be5a34e42170.
 The downloaded checkpoint is hash-verified; native vision and DSpark draft
 weights are included. The model path and tunable values are in serving.json.
 
 ## Operations
 
-Run these commands in this repository on the control host or c04:
+Run these commands in this repository on c02:
 
     ./ds41ctl start
     ./ds41ctl status
@@ -19,8 +19,14 @@ Run these commands in this repository on the control host or c04:
     ./sglang_load.py 2
     ./ds41ctl check
     ./ds41ctl check-reasoning
+    ./ds41ctl check-budget
+    ./ds41ctl check-search
 
-Start/restart sync the small runtime files to c04. The engine runs in a named
+The active target is now c02. Local start/restart uses local files; sync is a
+no-op on c02. The former c04 service was stopped and is being left to exit after
+a driver teardown stall. Its disk files were used as copy sources only.
+
+Remote start/restart sync the small runtime files to the configured target. The engine runs in a named
 tmux session and survives SSH disconnection. These commands only signal this
 controller's tracked process group. They refuse to start if another GPU job is
 present or a GPU reports a recovery action. Startup includes weight loading,
@@ -35,8 +41,8 @@ A machine reboot requires starting the service and tunnel again.
 
 ## API and vision
 
-Internal OpenAI-compatible base URL: http://10.78.202.32:18000/v1
-Anthropic-compatible base URL: http://10.78.202.32:18000
+Internal OpenAI-compatible base URL: http://10.78.202.30:18000/v1
+Anthropic-compatible base URL: http://10.78.202.30:18000
 Model name: deepseek-v4.1-flash-1017
 
 Use the separate API credential in .secrets/api-key. For Claude Code, set
@@ -53,7 +59,7 @@ per-request settings still take precedence.
 serving.json contains default_thinking=true and default_reasoning_effort="max".
 The launcher passes these through SGLang's native --default-chat-template-kwargs.
 This is necessary because Anthropic output_config.effort="max" alone previously
-left thinking at the engine's off default. The engine package itself is unmodified.
+left thinking at the engine's off default. The engine package files are unmodified; thinking_budget.py installs a small runtime adapter for explicit token budgets.
 
 Requests that omit the thinking toggle now reason at max effort. Anthropic
 thinking.type="disabled" and OpenAI reasoning_effort="none" still turn thinking
@@ -70,9 +76,11 @@ low/high/max for consistent behavior across the two protocols.
 
 Both APIs reach the same model. OpenAI Chat Completions returns reasoning_content;
 Anthropic Messages returns thinking content blocks. Anthropic adaptive thinking is
-implemented as enabled thinking, not Claude's adaptive policy. Anthropic
-thinking.budget_tokens is accepted for SDK compatibility but is not an independent
-hard cap; max_tokens limits total generated reasoning plus answer tokens.
+implemented as enabled thinking, not Claude's adaptive policy. The staged
+thinking_budget.py adapter connects Anthropic thinking.budget_tokens to native
+SGLang grammar masks when enforce_thinking_budget=true. max_tokens still limits
+reasoning plus answer together. Live budget validation on c02 is pending while
+checkpoint verification and first startup complete.
 
 Core text, reasoning, tool calls/round trips, images and streaming have been checked.
 This does not certify every OpenAI/Anthropic endpoint or provider-specific feature;
@@ -82,31 +90,26 @@ retesting a known fixture through OpenAI streaming/non-streaming and Anthropic
 streaming succeeded. Protocol compatibility does not guarantee recognition accuracy.
 Details are in audit/reasoning-check-20261031-154801/.
 
-DSH with an Anthropic-compatible provider needs an explicit adaptive-thinking
-compatibility setting for effort levels. Without it, the current DSH pi-ai
-transport sends thinking.budget_tokens (medium=8192, max=16384) and omits
-output_config.effort. SGLang does not enforce those budgets, so both use this
-deployment's default max effort. In the existing model entry in the active
-$DSH_HOME/profiles/<profile>/cordis.patch.yml, merge these fields while preserving
-the other model and provider settings:
+DSH's Anthropic provider has two different modes:
 
-```yaml
-- id: deepseek-v4.1-flash-1017
-  compat:
-    forceAdaptiveThinking: true
-  reasoningEfforts:
-    off:
-    low: low
-    medium: medium
-    high: high
-    max: max
-```
+- Budget mode (forceAdaptiveThinking=false or omitted): sends
+  thinking.type=enabled, thinking.budget_tokens, and max_tokens; it omits
+  output_config.effort. In the inspected pi-ai 1.3.0 transport, low=2048,
+  medium=8192, high=16384, max=16384 thinking tokens. These defaults can be
+  adjusted or clamped by the client. Off sends thinking.type=disabled.
+- Adaptive mode (forceAdaptiveThinking=true): sends thinking.type=adaptive
+  and output_config.effort=low/medium/high/max, without budget_tokens.
 
-The current transport then sends thinking.type=adaptive with
-output_config.effort for enabled levels, and thinking.type=disabled for off.
-The native effort mapping remains low=50, medium/high=75, max=100. If an older
-DSH version rejects forceAdaptiveThinking, use a version supporting this setting.
-The configuration takes effect on the next request; no SGLang restart is needed.
+To use the numerical budgets, remove the earlier forceAdaptiveThinking=true
+setting or set it to false in the existing model's compat section. This is a
+client setting; no client files have been changed here. Explicit effort, if also
+supplied, is preserved. Budget-only requests retain the server's max effort
+and differ by the enforced token cap, not by an inferred effort label.
+
+The transport may add its thinking allowance to its base answer allowance:
+with a 4096 base allowance, medium sent max_tokens=12288 and budget_tokens=8192;
+high/max sent max_tokens=20480 and budget_tokens=16384. The actual max_tokens
+field, not the UI label, remains the total output ceiling.
 
 A local reproduction using the pi-ai 1.3.0 dependency pinned by current DSH,
 including its upstream DSH patch, verified both request fields and streamed
@@ -116,6 +119,23 @@ diagnostics, not latency or quality guarantees. The user's inaccessible DSH
 installation and its reported identical 39-second times have not been inspected;
 the off failure did not reproduce in the current transport. Evidence is in
 audit/dsh-reasoning-20261031-155906/.
+
+Claude Code's "response exceeded ... output token maximum" message can occur
+even when CLAUDE_CODE_MAX_OUTPUT_TOKENS is honored: it reports an API response
+ending with stop_reason=max_tokens. Reasoning and the final answer share that
+limit. An actual Claude Code 2.1.314 test sent max_tokens=256, exhausted exactly
+256 tokens on each attempt, and reproduced that error; a second test sent
+max_tokens=16384 and completed normally after 426 tokens. These tests used
+isolated settings and a temporary loopback relay to capture only limit fields
+and response metadata. Evidence: audit/claude-budget-20261031-181030/.
+
+In this tested version, MAX_THINKING_TOKENS=1024 did not send a token budget for
+the custom DeepSeek model: Claude sent adaptive thinking and effort=high.
+CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1 also retained adaptive mode for this model
+in a follow-up test. Do not assume either setting supplies a hard budget here.
+The staged adapter addresses explicit numerical budgets. Adaptive requests
+carry no numerical budget and retain the current default policy. No automatic
+cap is inferred from an effort label.
 
 The published latency comparison used non-thinking synthetic token-ID prompts.
 Max thinking can generate additional reasoning tokens and delay the visible final
@@ -130,38 +150,67 @@ on request prefixes and the hybrid cache's eviction state.
 ./ds41ctl check uses an image with a random code, tests both vision APIs, and
 checks an Anthropic tool-call/result round trip, including streaming. Evidence is saved in audit/.
 
+## Web search
+
+Anthropic search is enabled by enable_web_search=true in serving.json.
+The Exa credential is stored separately in .secrets/exa-api-key (mode 0600),
+loaded into EXA_API_KEY for the engine, and redacted from controller output.
+Restart with ./ds41ctl restart after changing the setting or credential.
+No client URL or API authentication change is needed, including through port 8312.
+
+web_search.py adds a local compatibility adapter for /v1/messages. A request
+declaring a web_search_<date> server tool triggers one Exa Auto search using
+the last user text (or Claude Code's "for the query:" text). It supplies up to
+five source excerpts to the model and removes the server search tool before
+native inference. Images and ordinary client tools are preserved. Identical
+queries and domain filters are cached for ten minutes, including concurrent
+requests. Search failures return an explicit 502 rather than an unsearched answer.
+Requests without a server search tool pass through unchanged.
+
+The adapter reuses SGLang 0.5.23's native Exa HTTP client. Upstream Exa execution
+is officially supported for GPT-OSS/OpenAI Responses; the DeepSeek Anthropic
+bridge is local code, following the GLM deployment's approach. It returns
+ordinary model text with source links, not native Anthropic server-tool events
+or citation blocks. Dynamic filtering and autonomous multi-search tool loops
+are not implemented. allowed_domains and blocked_domains are translated to
+Exa filters; specifying both is rejected. Versioned search tools all use this
+same basic behavior. This does not add native search to DeepSeek /v1/responses.
+
+Use ./ds41ctl check-search for JSON/streaming search checks; this spends one
+search request if the query is not cached. Unit checks require no external calls:
+python3 -m unittest -v test_web_search.py.
+
 ## Remote tunnel
 
     ./ds41ctl tunnel-start
     ./ds41ctl tunnel-status
     ./ds41ctl tunnel-stop
 
-On your server (ssh.linsyking.com), use:
+FRPC runs on c02 through the loopback GOST HTTP proxy at 127.0.0.1:18080.
+The route is server port 8312 -> c02 10.78.202.30:18000. c04 is not an
+intermediate hop. The old c04 FRPC client has been stopped to release port 8312.
+
+On ssh.linsyking.com, use:
 OpenAI base URL: http://127.0.0.1:8312/v1
 Anthropic base URL: http://127.0.0.1:8312
 
-Server-local access is the requested scope. External access to port 8312 is
-not required, and no server firewall or public exposure change was made.
+Both APIs require the existing API key in .secrets/api-key, sent as
+Authorization: Bearer <key>. The API key is unchanged from c04. The separate
+FRP authentication token and server settings remain in .secrets/frpc.toml.
+Private files have mode 0600 inside a mode-0700 directory and are ignored by Git.
+Credentials are not included in normal runtime sync; provision them separately.
 
-FRPC connects to ssh.linsyking.com:17000 through the loopback HTTP proxy
-http://127.0.0.1:18080. GOST uses Cloudflare DNS over HTTPS:
+The controller checks that FRPC port 8312 targets the configured SGLang API,
+verifies API authentication, and starts GOST when needed. GOST uses Cloudflare
+DNS over HTTPS. FRPC transport TLS is enabled. FRPC runs under nohup in its own
+process group and reconnects after connection loss; logs are in .runs/frpc.log.
+tunnel-stop stops only owned FRPC; the loopback GOST proxy remains available.
+Access through server loopback is the intended scope; no firewall rules change.
 
-    nohup gost -L 'http://127.0.0.1:18080?resolver=https://1.1.1.1/dns-query' >/dev/null 2>&1 &
-
-The TCP mapping is remote port 8312 to c04's actual bound API
-10.78.202.32:18000. The sample's local port 8000 is not used. The FRP token is
-in .secrets/frpc.toml, separate from the API key. Private files have mode 0600
-inside a mode-0700 directory and are ignored by Git. Credentials are not
-included in normal runtime sync; they are provisioned separately over SSH.
-FRPC runs under nohup in its own process group, reconnects after connection
-loss, and logs to .runs/frpc.log. tunnel-stop stops only owned FRPC; GOST is
-left available. tunnel-start refuses to expose an API without authentication.
-FRP transport TLS protects c04-to-FRPS traffic. The server-local API uses HTTP
-and requires the same API key. FRPC login and proxy registration are verified;
-a loopback request on the remote server requires running a client there.
-
-GOST 3.3.0 was already installed. FRPC 0.71.1 linux/arm64 was downloaded from
-the official fatedier/frp release and verified against its SHA-256 checksum.
+FRPC 0.71.1 linux/arm64 was installed on c02 from the official release and
+verified against its published SHA-256 checksum. GOST 3.3.0 was already installed.
+Direct internal access remains available at http://10.78.202.30:18000/v1 for
+OpenAI or http://10.78.202.30:18000 for Anthropic.
 
 ## Evidence and maintenance
 

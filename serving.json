@@ -1,6 +1,6 @@
 {
-  "host": "10.78.202.32",
-  "hostname": "s04-p1-dgx-02-c04",
+  "host": "10.78.202.30",
+  "hostname": "s04-p1-dgx-02-c02",
   "port": 18000,
   "model_path": "/scratch_local/user_data/yiming/models/DeepSeek-V4.1-Flash-1017",
   "served_model_name": "deepseek-v4.1-flash-1017",
@@ -12,5 +12,7 @@
   "speculative_dspark_block_size": 5,
   "startup_timeout_seconds": 900,
   "default_thinking": true,
-  "default_reasoning_effort": "max"
+  "default_reasoning_effort": "max",
+  "enforce_thinking_budget": true,
+  "enable_web_search": true
 }

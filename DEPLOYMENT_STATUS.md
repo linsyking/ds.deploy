@@ -1,4 +1,41 @@
-# Deployment status — 2026-10-31
+# Deployment status — 2026-11-01
+
+## Exa web search
+
+On 2026-11-01 the user requested adding Exa and restarting the service.
+The provided Exa credential is in .secrets/exa-api-key, mode 0600, and is not
+part of Git or normal runtime sync. A direct Exa Auto request succeeded with
+three results and highlights; provider-reported cost was $0.007.
+
+web_search.py adds basic Anthropic /v1/messages search compatibility using
+SGLang's installed ExaClient, with five results, domain filters, a ten-minute
+bounded cache, and coalescing for concurrent duplicate searches. It supplies
+search evidence to the model rather than implementing Anthropic server-tool
+events or dynamic filtering. Ordinary client tools and images are preserved;
+requests without server search tools pass through unchanged. Provider failure
+returns an explicit 502. The key and query text are not logged by this adapter.
+
+enable_web_search=true is set in serving.json; ds41ctl loads EXA_API_KEY and
+registers the adapter only in the API process, without editing package files.
+Both API and Exa credentials are redacted from controller output. Existing
+API URLs, authentication, and forwarding remain in use.
+
+Validation before restart: all 14 no-network adapter tests passed, Python
+compilation and git diff --check passed, and middleware registration succeeded
+inside the deployment's CUDA/SGLang environment. Restart was launched; live
+search and normal API regression checks are pending readiness.
+
+## c02 migration
+
+The checkpoint and SGLang environment have been migrated from c04 to c02
+(10.78.202.30). All 83 checkpoint files (510,311,045,295 bytes) were hash-verified
+on c02 at 18:32 PDT on 2026-10-31. The engine became ready at 18:45:40 PDT.
+Live checks confirmed four GB200 GPUs with Recovery Action None, API
+health, bearer authentication, and OpenAI/Anthropic text inference. The API key
+matches c04. c02 uses uv-managed Python 3.11.15 and GCC/G++ 13.
+Full c02 vision, reasoning, and explicit-budget validation remains pending.
+The older c04 measurements below are historical, not c02 validation results.
+No c13 changes were made.
 
 ## Running service
 
@@ -26,7 +63,7 @@ Explicit off still produces no reasoning. Vision and tool round trips also work
 with the new default, including streamed thinking. See
 audit/reasoning-check-20261031-154801/ for detailed evidence and the noted
 random-image probe limitation.
-Claude Code files and FRPC/GOST configuration are unchanged.
+Claude Code files are unchanged.
 
 ## Measured selection
 
@@ -76,26 +113,21 @@ patched. The controller redacts credentials and preserves structured access logs
 
 ## Server-local tunnel
 
-- GOST 3.3.0 runs in the background on 127.0.0.1:18080, using https://1.1.1.1/dns-query.
-- FRPC 0.71.1 ARM64 was downloaded from its official release and checksum-verified.
-- FRPC uses transport.proxyURL=http://127.0.0.1:18080 and transport TLS.
-- Server: ssh.linsyking.com:17000; remote port 8312 forwards to c04 10.78.202.32:18000.
-- FRPC login and proxy registration succeeded; the background process is running.
-- Intended OpenAI base URL on your server: http://127.0.0.1:8312/v1.
-- Intended Anthropic base URL on your server: http://127.0.0.1:8312.
-- API key: .secrets/api-key, separate from the FRP transport token.
-- Credentials are ignored by Git, mode 0600, under a mode-0700 directory.
-- You confirmed server-local access only. External port 8312 access is not required; no firewall/public exposure changes were made.
-- A server-side loopback request was not tested from c04. Local API authentication, GOST routing, FRPC login and proxy registration were verified separately.
-
-Use ./ds41ctl tunnel-start, tunnel-status, and tunnel-stop for FRPC.
-The processes survive SSH logout; startup after a machine reboot is manual.
+- FRPC 0.71.1 runs on c02 through GOST 3.3.0 at 127.0.0.1:18080, with transport TLS enabled.
+- Server: ssh.linsyking.com:17000; server port 8312 forwards directly to c02 10.78.202.30:18000.
+- The tracked old c04 FRPC process was stopped to release port 8312. c04 is not an intermediate hop.
+- c02 FRPC login and proxy registration succeeded at 18:55:47 PDT on 2026-10-31.
+- Server-local OpenAI base URL: http://127.0.0.1:8312/v1; Anthropic base URL: http://127.0.0.1:8312.
+- API key: unchanged, in .secrets/api-key. Use Authorization: Bearer <key>.
+- FRP credentials are preserved in .secrets/frpc.toml; the route now targets c02.
+- FRPC was verified against the official release SHA-256 checksum; installation evidence is in .runs/frpc-install/install.json.
+- Use ./ds41ctl tunnel-start, tunnel-status, and tunnel-stop. Startup after a machine reboot is manual.
+- Server-local access is the intended scope; no firewall rules were changed.
 
 ## Files and evidence
 
 - Production entrypoints: ds41ctl and sglang_load.py; tunables in serving.json.
 - audit/deployment-validation.json: live settings, versions, authentication and GPU checks.
-- audit/tunnel-validation.json: tunnel checks and confirmed access scope.
 - audit/validation-20261031-150510/: eight native API/vision/streaming checks.
 - audit/performance/: request-level timings, summaries, and comparison.json.
 - audit/performance/benchmark-source.tar.gz: reproducible benchmark source/configs, checksum manifest alongside.
