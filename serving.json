@@ -14,5 +14,6 @@
   "default_thinking": true,
   "default_reasoning_effort": "max",
   "enforce_thinking_budget": true,
-  "enable_web_search": true
+  "enable_web_search": true,
+  "enable_documents": true
 }

@@ -1,4 +1,40 @@
-# Deployment status — 2026-11-01
+# Deployment status — 2026-11-12
+
+## PDF document input on c02
+
+`documents.py` adds Anthropic document support before native request validation.
+Both user attachments and documents inside `tool_result.content` expand into
+page-aligned extracted text and rendered images. The installed SGLang validator
+and multimodal converter then receive their existing text/image block types.
+No installed SGLang source files are edited. Ordinary form fields are included
+in rendering; scanned pages retain their image even when text extraction is empty.
+
+Base64 PDF, PDF URLs, and UTF-8/plain text sources are supported. Files API IDs
+and native citation events are explicitly unsupported. Rendering uses CPU
+PDFium 5.15.2 at 144 DPI with bounded page size, a bounded ten-minute memory
+cache, and serialized native access off the API event loop. Full local limits
+and installation commands are in README.md.
+
+`enable_documents=true` is the only added serving setting. Heretic's 38-tensor
+overlay, DSpark block 5, vision, thinking defaults/budgets, endpoint, bearer
+credential and the FRPC/GOST route to server port 8312 are retained. Exa query
+extraction runs before expansion so document text does not become search input.
+
+Validation: 23 document adapter tests, 14 existing search tests, one native
+SGLang validator/converter regression (both attachment placements), and eight
+existing checkpoint/swap tests passed. An initial live check passed all six
+API cases, and Claude Code Read correctly read the text code, image-only code,
+and chart. Final checks after the middleware-order restart passed: all six
+PDF API cases, Claude Code Read (including its nested base64 PDF document),
+and all eight standard text/vision/tool/SSE checks. The final service is healthy
+with PID 2449408. Evidence: `audit/documents-20261112-083619/` and
+`audit/validation-20261112-083623/`; configuration/overlay comparison is saved
+in `.runs/documents/final.json`.
+
+SGLang's `/v1/messages/count_tokens` accepts normalized document requests but
+retains the native estimate, which undercounts vision tokens. Generation
+`usage.input_tokens` includes the actual image expansion. This is not full
+Anthropic token-counting or citation parity.
 
 ## Exa web search
 

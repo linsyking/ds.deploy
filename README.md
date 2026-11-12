@@ -150,6 +150,58 @@ on request prefixes and the hybrid cache's eviction state.
 ./ds41ctl check uses an image with a random code, tests both vision APIs, and
 checks an Anthropic tool-call/result round trip, including streaming. Evidence is saved in audit/.
 
+## PDF and text documents
+
+`enable_documents=true` registers `documents.py` in the SGLang API process.
+It accepts Anthropic `document` blocks on `/v1/messages` and
+`/v1/messages/count_tokens`, both as user attachments and inside
+`tool_result.content` (including Claude Code's Read tool). Before native
+Pydantic validation, each PDF page becomes a text block with its extracted
+text and page number, followed by an image block containing that same page.
+SGLang's native multimodal converter and DeepSeek vision encoder process both.
+Image-only/scanned pages retain their page image. This follows Anthropic's
+[text plus page image design](https://platform.claude.com/docs/en/build-with-claude/pdf-support).
+
+Supported sources are base64 `application/pdf`, HTTP(S) PDF URLs,
+base64 UTF-8 `text/plain`, and `source: {"type":"text","data":"..."}`.
+Document `title` and `context` are included with the page text. Files API
+`file_id` references and native citation events are not implemented; requests
+enabling citations return a clear 400. Existing native response/SSE formats
+are unchanged. Invalid/encrypted PDFs are rejected rather than silently
+replaced with empty text. No client, API key, forwarding or model change is
+required. Disable the adapter with `enable_documents=false` and restart.
+
+PDFium renders at 144 DPI, capped at 2048 pixels per edge and 4 million pixels
+per page, with JPEG quality 92. Limits are 128 MiB of incoming JSON, 96 MiB of
+combined decoded document data, 256 MiB of expanded JSON, and 600 PDF pages
+per request (100 if configured context is below 1M). Pages are never silently
+truncated. The native model context limit still applies; 600 pages need not
+fit. Text-heavy pages above 200,000 characters must be split. These are local
+operational limits, not a promise of identical Anthropic token accounting.
+
+Rendering runs off the event loop, with serialized PDFium access and at most
+two outstanding workers. A 128 MiB, ten-minute memory cache keyed by PDF bytes
+avoids repeat rendering in conversation history, including concurrent
+duplicate requests. No PDF content is logged or persisted by the adapter.
+URL downloads have size and time bounds. The existing bearer authentication
+is checked before processing documents.
+
+When combined with Exa, search-query extraction runs before document expansion;
+the search provider receives the original user query, not extracted page text.
+`count_tokens` retains SGLang's native estimate, which undercounts vision
+tokens; generation `usage.input_tokens` includes the actual image expansion.
+
+Install the additional CPU dependency in the serving environment:
+
+    uv pip install --python .venvs/sglang/bin/python -r requirements-documents.txt
+    .venvs/sglang/bin/python -m unittest -v test_documents.py test_web_search.py
+    .venvs/sglang/bin/python check_documents.py
+
+`test_documents_native.py` additionally checks the installed SGLang validator
+and converter in the deployment's CUDA environment without loading the model.
+The live check uses a generated two-page PDF, with an image-only code and bar
+chart on page 2, and saves results under `audit/documents-*`.
+
 ## Web search
 
 Anthropic search is enabled by enable_web_search=true in serving.json.

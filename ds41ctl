@@ -33,7 +33,7 @@ TMUX = '/scratch_local/user_data/yiming/.local/bin/tmux'
 SOCKET = RUNS / 'ds41-tmux'
 SESSION = 'ds41-' + socket.gethostname().split('.')[0].rsplit('-', 1)[-1]
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-RUNTIME_FILES = ['ds41ctl', 'sglang_load.py', 'thinking_budget.py', 'web_search.py', 'serving.json', 'README.md', 'DEPLOYMENT_STATUS.md', '.gitignore']
+RUNTIME_FILES = ['ds41ctl', 'sglang_load.py', 'thinking_budget.py', 'web_search.py', 'documents.py', 'requirements-documents.txt', 'serving.json', 'README.md', 'DEPLOYMENT_STATUS.md', '.gitignore']
 PRIVATE = ROOT / '.secrets'
 AUTH_CONFIG = PRIVATE / 'sglang-auth.yaml'
 API_KEY = PRIVATE / 'api-key'
@@ -106,6 +106,8 @@ def config():
         raise ValueError('enforce_thinking_budget must be true or false')
     if not isinstance(cfg.get('enable_web_search', False), bool):
         raise ValueError('enable_web_search must be true or false')
+    if not isinstance(cfg.get('enable_documents', False), bool):
+        raise ValueError('enable_documents must be true or false')
     effort = cfg.get('default_reasoning_effort', 'high')
     if effort not in ('low', 'high', 'max') and not (type(effort) is int and 1 <= effort <= 100):
         raise ValueError('default_reasoning_effort must be low/high/max or an integer 1-100')
@@ -201,6 +203,8 @@ def preflight(cfg):
             raise RuntimeError(f'Required file is missing: {path}')
     if cfg.get('enable_web_search', False) and (not EXA_API_KEY.exists() or not EXA_API_KEY.read_text().strip()):
         raise RuntimeError('Web search requires a credential in .secrets/exa-api-key')
+    if cfg.get('enable_documents', False):
+        run([str(python), '-c', 'import pypdfium2, PIL, httpx'], timeout=20)
     probe = socket.socket()
     try:
         probe.settimeout(1)
@@ -308,6 +312,11 @@ def engine():
     from sglang.srt.utils import kill_process_tree
     load_plugins()
     server_args = prepare_server_args(sys.argv[2:])
+    if config().get('enable_documents', False):
+        from documents import install
+        install(api_key=API_KEY.read_text().strip(), context_length=config()['context_length'])
+    # Starlette inserts middleware at the front. Search must see the original
+    # user text, before documents expand, so page text never becomes its query.
     if config().get('enable_web_search', False):
         from web_search import install
         install(api_key=API_KEY.read_text().strip(), exa_api_key=EXA_API_KEY.read_text().strip())
@@ -392,6 +401,7 @@ def status(cfg):
               f'effort: {live.get("default_reasoning_effort", "high")} (request overrides take precedence)')
         print(f'Explicit thinking budgets: {live.get("enforce_thinking_budget", False)}')
         print(f'Anthropic web search: {"Exa" if live.get("enable_web_search", False) else "disabled"}')
+        print(f'Anthropic documents: {"PDF text + page images" if live.get("enable_documents", False) else "disabled"}')
         print(f'PID: {state["pid"]}; log: {LOG}')
     return 0 if is_healthy and state_is_alive(state) else 1
 
