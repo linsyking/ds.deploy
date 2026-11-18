@@ -36,6 +36,44 @@ retains the native estimate, which undercounts vision tokens. Generation
 `usage.input_tokens` includes the actual image expansion. This is not full
 Anthropic token-counting or citation parity.
 
+## MTI experiment on c02
+
+The experimental `mti.py` adapter ports the entropy-gated guidance in
+[MTI](https://arxiv.org/abs/2510.13940v4) to this DeepSeek V4.1/SGLang cache
+layout. It reuses prefix KV for a temporary `OUTPUT ERROR` continuation and
+restores pending compressor and Engram state before normal generation resumes.
+This prototype requires ordinary decoding and synchronous scheduling; DSpark
+integration remains further work. Native package files are unchanged.
+
+The requested Maxwell command was run with unchanged agent settings and tasks:
+`python -m bench run -c maxwell -a claude-ds -j 5`.
+
+| Configuration | Correct | Wall time | Sum of task durations |
+| --- | ---: | ---: | ---: |
+| Production DSpark | 5/5 | 23.8 min | 54.5 min |
+| Ordinary control | 4/5 | 60.0 min | 165.9 min |
+| MTI, entropy 1.5 / guidance 1.5 | 5/5 | 54.0 min | 179.9 min |
+
+MTI solved the ordinary control's timed-out case and used 47.0% fewer reported
+output tokens, including thinking and visible output. Its wall time improved
+10.0% against ordinary decoding, while summed task durations increased 8.4%.
+Production DSpark remains the preferred configuration on correctness and time.
+This is one exploratory trial per arm on five tasks, with sampling and native
+sparse top-k tie variability; the results do not establish a general accuracy gain.
+
+All eight unit tests and thirteen live validation checks passed, including
+temporary-branch comparisons through 8K-token prefixes and concurrent requests.
+Synthetic long-prefix checks use a stable sparse top-k tie rule; this helper is
+removed before the measured benchmark, which retains native kernels.
+See [MTI_EXPERIMENT.md](MTI_EXPERIMENT.md) for per-case results, implementation
+limits, pinned author code, source hashes, and retained artifacts.
+
+The exact saved production configuration has been restored. DSpark block size 5
+and overlap scheduling are active; MTI is disabled and its environment hook is
+absent. OpenAI and Anthropic text smoke checks passed after readiness. The API
+credential matches the baseline credential. The existing FRPC process and
+server-local port 8312 mapping to c02:18000 are unchanged.
+
 ## Exa web search
 
 On 2026-11-01 the user requested adding Exa and restarting the service.

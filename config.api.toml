@@ -1,0 +1,29 @@
+model = "gpt-6.1-sol"
+model_provider = "aihub"
+model_reasoning_effort = "xhigh"
+[tui]
+screen_reader_detection_done = true
+
+[tui.model_availability_nux]
+"gpt-6.1-sol" = 4
+
+
+[model_providers.aihub]
+name = "OpenAI"
+base_url = "https://cli.linsyking.com/v1"
+wire_api = "responses"
+requires_openai_auth = true
+experimental_bearer_token = "sk-JUR7KelzWmh9eCsQQt7BTNED7SFBkeD1OJEJKUG7St7j5AIv"
+supports_websockets = false
+
+[notice]
+hide_rate_limit_model_nudge = true
+
+[projects."/scratch_local/user_data/yiming/mc/modelclaim_paper"]
+trust_level = "trusted"
+
+[projects."/scratch_local/user_data/yiming/deploy/ds.deploy"]
+trust_level = "trusted"
+
+[projects."/scratch_local/user_data/yiming/deploy/ai-sde-benchmark"]
+trust_level = "trusted"

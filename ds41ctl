@@ -33,7 +33,7 @@ TMUX = '/scratch_local/user_data/yiming/.local/bin/tmux'
 SOCKET = RUNS / 'ds41-tmux'
 SESSION = 'ds41-' + socket.gethostname().split('.')[0].rsplit('-', 1)[-1]
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-RUNTIME_FILES = ['ds41ctl', 'sglang_load.py', 'thinking_budget.py', 'web_search.py', 'documents.py', 'requirements-documents.txt', 'serving.json', 'README.md', 'DEPLOYMENT_STATUS.md', '.gitignore']
+RUNTIME_FILES = ['ds41ctl', 'sglang_load.py', 'thinking_budget.py', 'web_search.py', 'documents.py', 'requirements-documents.txt', 'mti.py', 'checkpoint_overlay.py', 'modelctl', 'serving.json', 'README.md', 'DEPLOYMENT_STATUS.md', '.gitignore']
 PRIVATE = ROOT / '.secrets'
 AUTH_CONFIG = PRIVATE / 'sglang-auth.yaml'
 API_KEY = PRIVATE / 'api-key'
@@ -90,6 +90,15 @@ if os.environ.get('DS41_THINKING_BUDGET') == '1':
     from thinking_budget import install
     install()
 
+if os.environ.get('DS41_MTI_EXPERIMENT') == '1':
+    from mti import install
+    install()
+
+if os.environ.get('DS41_CHECKPOINT_PATCH'):
+    from checkpoint_overlay import install
+    install(os.environ['DS41_CHECKPOINT_PATCH'], os.environ['DS41_CHECKPOINT_BASE'],
+            os.environ['DS41_CHECKPOINT_AUDIT_DIR'])
+
 
 def config():
     cfg = json.loads(CONFIG_PATH.read_text())
@@ -108,6 +117,10 @@ def config():
         raise ValueError('enable_web_search must be true or false')
     if not isinstance(cfg.get('enable_documents', False), bool):
         raise ValueError('enable_documents must be true or false')
+    if not isinstance(cfg.get('mti_experiment', False), bool):
+        raise ValueError('mti_experiment must be true or false')
+    if cfg.get('checkpoint_patch') is not None and not isinstance(cfg['checkpoint_patch'], str):
+        raise ValueError('checkpoint_patch must be a path string or null')
     effort = cfg.get('default_reasoning_effort', 'high')
     if effort not in ('low', 'high', 'max') and not (type(effort) is int and 1 <= effort <= 100):
         raise ValueError('default_reasoning_effort must be low/high/max or an integer 1-100')
@@ -205,6 +218,9 @@ def preflight(cfg):
         raise RuntimeError('Web search requires a credential in .secrets/exa-api-key')
     if cfg.get('enable_documents', False):
         run([str(python), '-c', 'import pypdfium2, PIL, httpx'], timeout=20)
+    if cfg.get('checkpoint_patch'):
+        from checkpoint_overlay import validate_patch
+        validate_patch(cfg['model_path'], cfg['checkpoint_patch'])
     probe = socket.socket()
     try:
         probe.settimeout(1)
@@ -255,6 +271,15 @@ def launch_environment(cfg):
     env.pop('DS41_THINKING_BUDGET', None)
     env.pop('SGLANG_MAX_THINK_TOKENS', None)
     env.pop('EXA_API_KEY', None)
+    env.pop('DS41_MTI_EXPERIMENT', None)
+    for key in ['DS41_CHECKPOINT_PATCH', 'DS41_CHECKPOINT_BASE', 'DS41_CHECKPOINT_AUDIT_DIR']:
+        env.pop(key, None)
+    if cfg.get('checkpoint_patch'):
+        env.update(DS41_CHECKPOINT_PATCH=cfg['checkpoint_patch'],
+                   DS41_CHECKPOINT_BASE=cfg['model_path'],
+                   DS41_CHECKPOINT_AUDIT_DIR=str(RUNS / 'heretic/loads' / f'{os.getpid()}-{time.time_ns()}'))
+    if cfg.get('mti_experiment', False):
+        env['DS41_MTI_EXPERIMENT'] = '1'
     if cfg.get('enable_web_search', False):
         env['EXA_API_KEY'] = EXA_API_KEY.read_text().strip()
     if cfg.get('enforce_thinking_budget', False):
@@ -290,13 +315,18 @@ def serve(cfg):
                '--default-chat-template-kwargs', json.dumps({
                    'thinking': cfg.get('default_thinking', False),
                    'reasoning_effort': cfg.get('default_reasoning_effort', 'high')}),
-               '--enable-metrics', '--enable-cache-report', '--enable-decoder-swa-bounded-replay',
-               '--speculative-algorithm', 'DSPARK',
-               '--speculative-dspark-block-size', str(cfg['speculative_dspark_block_size'])]
+               '--enable-metrics', '--enable-cache-report', '--enable-decoder-swa-bounded-replay']
+    if cfg.get('mti_experiment', False):
+        command.append('--disable-overlap-schedule')
+    else:
+        command.extend(['--speculative-algorithm', 'DSPARK',
+                        '--speculative-dspark-block-size', str(cfg['speculative_dspark_block_size'])])
     if cfg.get('enforce_thinking_budget', False):
         command.append('--enable-strict-thinking')
     state = dict(proc_info(os.getpid()), command=command, config=cfg, started_at=time.time(),
                  log=str(LOG), cache_root=str(RUNS / 'kernel-cache/sglang'))
+    if env.get('DS41_CHECKPOINT_AUDIT_DIR'):
+        state['checkpoint_overlay_audit'] = env['DS41_CHECKPOINT_AUDIT_DIR']
     temporary = STATE.with_suffix('.tmp')
     temporary.write_text(json.dumps(state, indent=2) + chr(10))
     temporary.replace(STATE)
@@ -394,9 +424,14 @@ def status(cfg):
     print(f'Tmux: {"up" if session_exists() else "down"}; owned engine: {"up" if state_is_alive(state) else "down"}')
     if state and state_is_alive(state):
         live = state['config']
+        print('Checkpoint weights: ' + ('Heretic overlay (38 tensors)' if live.get('checkpoint_patch') else 'official'))
         print(f'Model: {live["served_model_name"]}; TP4 / EP4; vision enabled; context {live["context_length"]:,}')
         print(f'Max running: {live["max_running_requests"]}; prefill chunk: {live["chunked_prefill_size"]}; '
-              f'static memory: {live["mem_fraction_static"]}; DSpark block: {live["speculative_dspark_block_size"]}')
+              f'static memory: {live["mem_fraction_static"]}')
+        if live.get('mti_experiment', False):
+            print('Decoding: ordinary; synchronous scheduling; experimental MTI adapter loaded')
+        else:
+            print(f'Decoding: DSpark block {live["speculative_dspark_block_size"]}')
         print(f'Thinking default: {live.get("default_thinking", False)}; '
               f'effort: {live.get("default_reasoning_effort", "high")} (request overrides take precedence)')
         print(f'Explicit thinking budgets: {live.get("enforce_thinking_budget", False)}')

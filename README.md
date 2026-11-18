@@ -22,6 +22,28 @@ Run these commands in this repository on c02:
     ./ds41ctl check-budget
     ./ds41ctl check-search
 
+### Official / Heretic weight switching
+
+`./modelctl heretic` restarts the owned service with pqhaz's pinned 1017
+attention-weight replacements; `./modelctl official` restarts with the original
+weights. `./modelctl status` shows which variant is actually running. A failed
+startup or incomplete four-rank overlay audit automatically restores the
+previous configuration and service. Switching takes a full model restart.
+
+Both variants use the same original 48 checkpoint shards. No shards are copied,
+patched on disk, or removed. The only additional weight file is the 1.59 GB
+`heretic_patch.safetensors` under `.runs/heretic/source/12d58ad0878b5008e80d720251adb969a0069412/patch/`.
+`checkpoint_overlay.py` substitutes its 38 named CPU tensors before native
+SGLang TP sharding; experts, scales, vision, tokenizer, encoding and DSpark draft
+weights stay on the native loading path. The added upstream Jinja template is
+not used. Patch SHA-256, original revision, tensor names, shapes and dtypes are
+checked, with per-rank load records under `.runs/heretic/loads/`.
+
+Only `checkpoint_patch` in serving.json changes when selecting Heretic. The
+model path, served model alias, authentication, forwarding and inference
+settings are retained. Configuration backups and switch outcomes are under
+`.runs/model-switch/`. Keep the patch file for future Heretic starts.
+
 The active target is now c02. Local start/restart uses local files; sync is a
 no-op on c02. The former c04 service was stopped and is being left to exit after
 a driver teardown stall. Its disk files were used as copy sources only.
@@ -38,6 +60,27 @@ scratch caches under .runs/kernel-cache/sglang. Model files are at
 /scratch_local/user_data/yiming/models/DeepSeek-V4.1-Flash-1017.
 GPU reset/reboot and automatic crash-restart are deliberately not performed.
 A machine reboot requires starting the service and tunnel again.
+
+## Experimental MTI decoding
+
+`mti.py` ports the entropy-gated negative-prompt guidance in
+[MTI](https://arxiv.org/abs/2510.13940v4) to this model's SGLang cache layout.
+The default deployment does not load the adapter. Setting `mti_experiment=true`
+in serving.json loads it and selects ordinary decoding with synchronous
+scheduling; this prototype requires TP4/EP4 and does not support DSpark.
+
+The local `.runs/mti/runtime.json` file separately controls whether guidance
+is active. The measured configuration uses `enabled=true`, `threshold=1.5`,
+and `scale=1.5`. The temporary `OUTPUT ERROR` cue shares prefix KV and is
+discarded before normal generation continues. This changes decoding, rather
+than assigning a thinking-token budget.
+
+`mti_experiment.py` coordinates the local Maxwell comparison using the retained
+experiment manifest, and restores the saved production configuration in
+`finally`. Its debug flag can retain the experimental engine after a failure.
+See [MTI_EXPERIMENT.md](MTI_EXPERIMENT.md) for results, validation, limitations,
+and artifact locations. `mti_validation.py` provides a deterministic top-k
+oracle for synthetic checks only; measured benchmark runs use native kernels.
 
 ## API and vision
 
@@ -79,8 +122,10 @@ Anthropic Messages returns thinking content blocks. Anthropic adaptive thinking 
 implemented as enabled thinking, not Claude's adaptive policy. The staged
 thinking_budget.py adapter connects Anthropic thinking.budget_tokens to native
 SGLang grammar masks when enforce_thinking_budget=true. max_tokens still limits
-reasoning plus answer together. Live budget validation on c02 is pending while
-checkpoint verification and first startup complete.
+reasoning plus answer together. A local five-task Maxwell run on c02 enforced
+an explicit 16,384-token thinking cap, reached it on 33 responses, and solved
+all five tasks without total-output truncation. Its artifacts are under
+`.runs/budget-sweep/20261103-173318/think16k_ctx500k/`.
 
 Core text, reasoning, tool calls/round trips, images and streaming have been checked.
 This does not certify every OpenAI/Anthropic endpoint or provider-specific feature;
@@ -136,6 +181,15 @@ in a follow-up test. Do not assume either setting supplies a hard budget here.
 The staged adapter addresses explicit numerical budgets. Adaptive requests
 carry no numerical budget and retain the current default policy. No automatic
 cap is inferred from an effort label.
+
+Claude Code 2.1.317 was also checked against the local endpoint. Positive
+`MAX_THINKING_TOKENS` values still produced adaptive requests without a numeric
+budget for this DeepSeek alias, including with
+`CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1`. The installed client's disable switch
+only changes fixed/adaptive selection for Opus/Sonnet 4.6. The budget experiments
+therefore use an isolated relay that supplies explicit `thinking.budget_tokens`;
+they do not change the production service or global Claude settings. Request
+metadata evidence: `.runs/endpoint-budget/20261103-172945-cli-env/summary.json`.
 
 The published latency comparison used non-thinking synthetic token-ID prompts.
 Max thinking can generate additional reasoning tokens and delay the visible final

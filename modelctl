@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""Switch the owned service between official and Heretic weights, without copies."""
+import argparse
+import datetime
+import fcntl
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+
+from checkpoint_overlay import PATCH, EXPECTED_KEYS, PATCH_SHA256, validate_patch
+
+ROOT = Path(__file__).resolve().parent
+
+
+def atomic_write(path, data):
+    temporary = path.with_name(path.name + '.tmp')
+    with temporary.open('wb') as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(path)
+
+
+def controller(root, action):
+    subprocess.run([sys.executable, str(root / 'ds41ctl'), action], check=True)
+
+
+def validate_loaded(root, variant):
+    state = json.loads((root / '.runs/service.json').read_text())
+    live = state['config']
+    if bool(live.get('checkpoint_patch')) != (variant == 'heretic'):
+        raise RuntimeError('Running checkpoint variant does not match the requested variant')
+    if variant == 'heretic':
+        directory = Path(state['checkpoint_overlay_audit'])
+        records = [json.loads(p.read_text()) for p in directory.glob('*.json')]
+        if len(records) != 4 or {r['rank'] for r in records} != {0, 1, 2, 3}:
+            raise RuntimeError('Expected successful overlay-load records from all four TP ranks')
+        for record in records:
+            if (record.get('sha256') != PATCH_SHA256 or
+                    set(record.get('applied_tensor_names', [])) != EXPECTED_KEYS or
+                    record.get('base') != str(Path(live['model_path']).resolve())):
+                raise RuntimeError('Overlay load record does not match the pinned 38-tensor patch')
+
+
+def switch(root, variant):
+    """Restore the exact previous config and service if the requested start fails."""
+    config_path = root / 'serving.json'
+    previous_bytes = config_path.read_bytes()
+    previous = json.loads(previous_bytes)
+    desired = dict(previous)
+    if variant == 'heretic':
+        validate_patch(previous['model_path'], PATCH)
+        desired['checkpoint_patch'] = str(PATCH)
+    else:
+        desired.pop('checkpoint_patch', None)
+    state_path = root / '.runs/service.json'
+    state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    if desired == previous and state.get('config') == desired:
+        try:
+            controller(root, 'status')
+        except subprocess.CalledProcessError:
+            pass
+        else:
+            validate_loaded(root, variant)
+            print(f'Already running {variant} weights.', flush=True)
+            return
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d-%H%M%S-%fZ')
+    journal = root / '.runs/model-switch' / stamp
+    journal.mkdir(parents=True)
+    (journal / 'serving.before.json').write_bytes(previous_bytes)
+    (journal / 'serving.requested.json').write_text(json.dumps(desired, indent=2) + '\n')
+    outcome = {'variant': variant, 'base_path': previous['model_path'], 'status': 'switching'}
+    def save():
+        atomic_write(journal / 'result.json', (json.dumps(outcome, indent=2) + '\n').encode())
+    save()
+    # Validate before stopping and detect configuration changes made meanwhile.
+    if config_path.read_bytes() != previous_bytes:
+        raise RuntimeError('serving.json changed during preflight; no service was stopped')
+    print(f'Switching to {variant}; all original shards stay in place. Backup: {journal}', flush=True)
+    try:
+        controller(root, 'stop')
+        if config_path.read_bytes() != previous_bytes:
+            raise RuntimeError('serving.json changed while stopping')
+        data = previous_bytes if desired == previous else (json.dumps(desired, indent=2) + '\n').encode()
+        atomic_write(config_path, data)
+        controller(root, 'start')
+        validate_loaded(root, variant)
+    except BaseException as error:
+        outcome.update(status='rolling_back', error=f'{type(error).__name__}: {error}')
+        save()
+        print('Requested startup failed; restoring the previous configuration and service.', flush=True)
+        # Finish rollback even if a second Ctrl+C arrives.
+        old_handlers = {s: signal.signal(s, signal.SIG_IGN) for s in (signal.SIGINT, signal.SIGTERM)}
+        try:
+            controller(root, 'stop')
+            atomic_write(config_path, previous_bytes)
+            controller(root, 'start')
+            validate_loaded(root, 'heretic' if previous.get('checkpoint_patch') else 'official')
+            outcome['status'] = 'rolled_back'
+            save()
+        except BaseException as rollback_error:
+            outcome.update(status='rollback_failed', rollback_error=str(rollback_error))
+            save()
+            raise RuntimeError(f'Rollback failed. Inspect {journal}; run ./modelctl official to recover.') from rollback_error
+        finally:
+            for signum, handler in old_handlers.items():
+                signal.signal(signum, handler)
+        raise RuntimeError(f'Switch failed; previous service restored. Details: {journal}') from error
+    outcome['status'] = 'ready'
+    save()
+    print(f'Ready with {variant} weights. API name, credential, forwarding and other settings are retained.', flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('variant', choices=['official', 'heretic', 'status'])
+    args = parser.parse_args()
+    if args.variant == 'status':
+        return subprocess.call([sys.executable, str(ROOT / 'ds41ctl'), 'status'])
+    os.umask(0o077)
+    (ROOT / '.runs').mkdir(exist_ok=True)
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt(f'Received signal {signum}')
+    signal.signal(signal.SIGTERM, interrupted)
+    with (ROOT / '.runs/model-switch.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        switch(ROOT, args.variant)
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
+        print(f'ERROR: {error}', file=sys.stderr)
+        sys.exit(1)
